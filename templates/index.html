@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AniGrab</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="apple-touch-icon" href="/static/icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="mascot-container">
+                <img src="/static/mascot.png" alt="Faputa" class="mascot-image" />
+            </div>
+            <h1>AniGrab</h1>
+            <p class="subtitle">Connect Mullvad first, then paste a link</p>
+        </header>
+
+        <!-- Input Section -->
+        <section id="input-section" class="card">
+            <div class="input-group">
+                <input
+                    type="text"
+                    id="link-input"
+                    placeholder="Paste nyaa.si URL or magnet link..."
+                    autocomplete="off"
+                    autocorrect="off"
+                    autocapitalize="off"
+                    spellcheck="false"
+                >
+                <button id="submit-btn" class="btn primary">
+                    <span class="btn-text">Check</span>
+                    <span class="btn-loader hidden"></span>
+                </button>
+            </div>
+            <p id="input-error" class="error hidden"></p>
+        </section>
+
+        <!-- Confirmation Section -->
+        <section id="confirm-section" class="card hidden">
+            <h2>Confirm Download</h2>
+            <div class="media-info">
+                <div class="info-row">
+                    <span class="label">Title:</span>
+                    <span id="media-title" class="value">-</span>
+                </div>
+                <div class="info-row" id="size-row">
+                    <span class="label">Size:</span>
+                    <span id="media-size" class="value">-</span>
+                </div>
+                <div class="info-row" id="seeders-row">
+                    <span class="label">Seeders:</span>
+                    <span id="media-seeders" class="value seeders">-</span>
+                </div>
+                <div class="info-row" id="leechers-row">
+                    <span class="label">Leechers:</span>
+                    <span id="media-leechers" class="value leechers">-</span>
+                </div>
+            </div>
+            <div class="button-group">
+                <button id="cancel-btn" class="btn secondary">Cancel</button>
+                <button id="confirm-btn" class="btn primary">Download</button>
+            </div>
+        </section>
+
+        <!-- Status Section -->
+        <section id="status-section" class="card hidden">
+            <h2>Download Status</h2>
+
+            <!-- Status Steps -->
+            <div class="status-steps">
+                <div class="step" id="step-mullvad">
+                    <div class="step-icon">
+                        <div class="icon pending"></div>
+                    </div>
+                    <div class="step-content">
+                        <span class="step-title">Mullvad VPN</span>
+                        <span class="step-message" id="mullvad-message">Waiting...</span>
+                    </div>
+                </div>
+
+                <div class="step" id="step-qbittorrent">
+                    <div class="step-icon">
+                        <div class="icon pending"></div>
+                    </div>
+                    <div class="step-content">
+                        <span class="step-title">qBittorrent</span>
+                        <span class="step-message" id="qbt-message">Waiting...</span>
+                    </div>
+                </div>
+
+                <div class="step" id="step-download">
+                    <div class="step-icon">
+                        <div class="icon pending"></div>
+                    </div>
+                    <div class="step-content">
+                        <span class="step-title">Download</span>
+                        <span class="step-message" id="download-message">Waiting...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Progress Section -->
+            <div id="progress-section" class="hidden">
+                <div class="progress-info">
+                    <span id="progress-name" class="progress-name"></span>
+                </div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="progress-stats">
+                    <span id="progress-percent">0%</span>
+                    <span id="progress-speed">-</span>
+                    <span id="progress-eta">-</span>
+                </div>
+                <div class="progress-size">
+                    <span id="progress-downloaded">0 B</span>
+                    <span> / </span>
+                    <span id="progress-total">0 B</span>
+                </div>
+                <button id="cancel-download-btn" class="btn secondary">Cancel Download</button>
+            </div>
+
+            <!-- Complete Message -->
+            <div id="complete-section" class="hidden">
+                <div class="complete-icon">&#10003;</div>
+                <p class="complete-message">Download complete!</p>
+                <p id="complete-name" class="complete-name"></p>
+            </div>
+
+            <!-- Post-Processing Section -->
+            <div id="postprocess-section" class="hidden">
+                <h3>Organize Download</h3>
+
+                <!-- Plex Mode Toggle -->
+                <div class="postprocess-group plex-toggle-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="plex-mode-toggle" checked />
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Plex Mode</span>
+                    </label>
+                    <span class="plex-hint">Creates: Show (Year)/Season XX/sXXeXX format</span>
+                </div>
+
+                <!-- Name editing -->
+                <div class="postprocess-group">
+                    <label for="clean-name-input">Show Name:</label>
+                    <div class="name-input-row">
+                        <input type="text" id="clean-name-input" />
+                        <span class="detected-badge">Auto-detected</span>
+                    </div>
+                </div>
+
+                <!-- Plex metadata (shown when Plex mode enabled) -->
+                <div id="plex-metadata" class="postprocess-group">
+                    <div class="plex-info-row">
+                        <span class="plex-label">Year:</span>
+                        <span id="plex-year" class="plex-value">-</span>
+                    </div>
+                    <div class="plex-info-row">
+                        <span class="plex-label">Season:</span>
+                        <input type="number" id="plex-season" value="1" min="1" max="99" class="plex-season-input" />
+                    </div>
+                </div>
+
+                <!-- Image selection -->
+                <div class="postprocess-group">
+                    <label>Cover Image:</label>
+                    <div class="image-grid" id="image-options">
+                        <!-- Images loaded dynamically -->
+                    </div>
+                    <div id="no-images-message" class="hidden">
+                        <p class="no-images-text">No images found</p>
+                    </div>
+                    <div class="image-search-row">
+                        <input type="text" id="image-search-input" placeholder="Search anime name..." />
+                        <button id="search-images-btn" class="btn secondary small">Search</button>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button id="skip-postprocess" class="btn secondary">Skip</button>
+                    <button id="apply-postprocess" class="btn primary">Apply</button>
+                </div>
+            </div>
+
+            <!-- DHT Error Section (with restart button) -->
+            <div id="dht-error-section" class="hidden">
+                <div class="warning-icon">&#9888;</div>
+                <p class="warning-message">qBittorrent has 0 DHT nodes</p>
+                <p class="warning-hint">Restart qBittorrent to connect to the DHT network</p>
+                <button id="restart-qbt-btn" class="btn primary">Restart qBittorrent</button>
+            </div>
+
+            <!-- Error Message -->
+            <div id="error-section" class="hidden">
+                <div class="error-icon">&#10007;</div>
+                <p id="error-message" class="error-message"></p>
+            </div>
+
+            <button id="new-download-btn" class="btn primary hidden">New Download</button>
+        </section>
+
+        <!-- System Status Footer -->
+        <footer id="system-status">
+            <div class="status-item">
+                <span class="status-dot" id="mullvad-dot"></span>
+                <span>Mullvad</span>
+            </div>
+            <div class="status-item">
+                <span class="status-dot" id="qbt-dot"></span>
+                <span>qBittorrent</span>
+                <span id="dht-nodes" class="dht-info"></span>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
