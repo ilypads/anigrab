@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-CLI tool for cleaning anime folder/file names and fetching cover images.
+CLI tool for cleaning anime folder/file names and organizing for Plex.
+
+Uses anitopy for filename parsing and AniList for metadata lookup.
 
 Usage:
     # Interactive mode - process all folders in directory
@@ -14,12 +16,6 @@ Usage:
 
     # Auto mode - no prompts, use auto-detected names
     python cli.py --auto /path/to/anime
-
-    # Auto mode with dry run
-    python cli.py --auto --dry-run /path/to/anime
-
-    # Skip image fetching
-    python cli.py --no-images /path/to/anime
 
     # Plex restructure - reorganize for Plex naming convention
     # Detects movies vs series automatically
@@ -45,7 +41,7 @@ from cleaner import (
     detect_media_type, restructure_for_plex_movie, extract_base_name_and_season
 )
 from config import config
-from images import search_anilist, download_image
+from anilist import search_anilist
 
 
 class Colors:
@@ -87,51 +83,6 @@ def print_warning(text: str):
 
 def print_error(text: str):
     print(f"  {Colors.RED}✗{Colors.RESET} {text}")
-
-
-def get_folders_missing_images(path: Path, recursive: bool = False) -> list[Path]:
-    """Get list of folders missing cover.jpg."""
-    if path.is_file():
-        print_error(f"Path is a file, not a directory: {path}")
-        return []
-
-    if not path.exists():
-        print_error(f"Path does not exist: {path}")
-        return []
-
-    folders = []
-
-    def scan_dir(dir_path: Path, depth: int = 0):
-        """Recursively scan for folders missing cover.jpg."""
-        for item in sorted(dir_path.iterdir()):
-            if item.is_dir():
-                # Check if folder has media files but no cover
-                has_media = any(
-                    f.suffix.lower() in {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
-                    for f in item.iterdir() if f.is_file()
-                )
-                has_cover = (item / "cover.jpg").exists()
-
-                if has_media and not has_cover:
-                    folders.append(item)
-
-                # Recurse if enabled
-                if recursive and depth < 3:
-                    scan_dir(item, depth + 1)
-
-    # Check path itself
-    has_media = any(
-        f.suffix.lower() in {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
-        for f in path.iterdir() if f.is_file()
-    )
-    has_cover = (path / "cover.jpg").exists()
-    if has_media and not has_cover:
-        folders.append(path)
-
-    # Scan subfolders
-    scan_dir(path, depth=0)
-
-    return folders
 
 
 def get_folders_for_plex(path: Path, recursive: bool = False, force: bool = False) -> list[Path]:
@@ -226,92 +177,13 @@ def get_folders_to_process(path: Path, recursive: bool = False) -> list[Path]:
     return folders
 
 
-async def process_images_only(
+async def process_folder(
     folder: Path,
     dry_run: bool = False,
     auto: bool = False
 ) -> bool:
     """
-    Only fetch cover image for a folder (no renaming).
-    Returns True if image was downloaded (or would be in dry run).
-    """
-    print_header(f"Processing: {folder.name}")
-
-    cover_path = folder / "cover.jpg"
-    poster_path = folder / "poster.jpg"
-
-    # Use folder name for search
-    search_name = folder.name
-
-    # Search AniList
-    results = await search_anilist(search_name)
-
-    if not results:
-        print_warning("No results found on AniList")
-        if not auto:
-            manual_query = input(f"  {Colors.BOLD}Enter anime name to search (or 's' to skip):{Colors.RESET} ").strip()
-            if manual_query and manual_query.lower() != 's':
-                results = await search_anilist(manual_query)
-                if results:
-                    print_success(f"Found {len(results)} result(s)")
-
-    if not results:
-        print_info("Skipped - no results")
-        return False
-
-    if auto:
-        best = results[0]
-        if dry_run:
-            print_info(f"Would download cover for: {best.display_title} ({best.year})")
-        else:
-            if best.best_cover:
-                success = await download_image(best.best_cover, str(cover_path), str(poster_path))
-                if success:
-                    print_success(f"Downloaded cover for: {best.display_title}")
-                    print_info("Also saved as poster.jpg for Plex")
-                else:
-                    print_error("Failed to download cover")
-            else:
-                print_warning("No cover image available")
-        return True
-    else:
-        # Interactive: show options
-        print(f"\n  {Colors.BOLD}AniList results:{Colors.RESET}")
-        for i, result in enumerate(results[:5], 1):
-            year = f"({result.year})" if result.year else ""
-            eps = f"{result.episodes} eps" if result.episodes else ""
-            print(f"    {i}. {result.display_title} {year} {eps}")
-
-        choice = input(f"\n  {Colors.BOLD}Select (1-5, or 's' to skip):{Colors.RESET} ").strip()
-
-        if choice.lower() != 's' and choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(results):
-                selected = results[idx]
-                if dry_run:
-                    print_info(f"Would download cover for: {selected.display_title}")
-                elif selected.best_cover:
-                    success = await download_image(selected.best_cover, str(cover_path), str(poster_path))
-                    if success:
-                        print_success(f"Downloaded cover for: {selected.display_title}")
-                        print_info("Also saved as poster.jpg for Plex")
-                        return True
-                    else:
-                        print_error("Failed to download cover")
-        else:
-            print_info("Skipped")
-
-    return False
-
-
-async def process_folder(
-    folder: Path,
-    dry_run: bool = False,
-    auto: bool = False,
-    fetch_images: bool = True
-) -> bool:
-    """
-    Process a single folder.
+    Process a single folder - clean name and rename files.
     Returns True if changes were made (or would be made in dry run).
     """
     print_header(f"Processing: {folder.name}")
@@ -370,71 +242,6 @@ async def process_folder(
                 print_info("No files needed renaming")
         except Exception as e:
             print_error(f"Failed to rename files: {e}")
-
-    # Fetch cover image
-    if fetch_images:
-        print(f"\n  {Colors.BOLD}Cover image:{Colors.RESET}")
-        cover_path = folder / "cover.jpg"
-        poster_path = folder / "poster.jpg"  # For Plex compatibility
-
-        if cover_path.exists():
-            print_info("Cover image already exists")
-        else:
-            # Search AniList
-            results = await search_anilist(detected_name)
-
-            if not results:
-                print_warning("No results found on AniList")
-                if not auto:
-                    # Prompt for manual search
-                    manual_query = input(f"  {Colors.BOLD}Enter anime name to search (or 's' to skip):{Colors.RESET} ").strip()
-                    if manual_query and manual_query.lower() != 's':
-                        results = await search_anilist(manual_query)
-                        if results:
-                            print_success(f"Found {len(results)} result(s)")
-
-            if not results:
-                pass  # Skip image download
-            elif auto:
-                # Auto mode: use first result
-                best = results[0]
-                if dry_run:
-                    print_info(f"Would download cover for: {best.display_title} ({best.year})")
-                else:
-                    if best.best_cover:
-                        success = await download_image(best.best_cover, str(cover_path), str(poster_path))
-                        if success:
-                            print_success(f"Downloaded cover for: {best.display_title}")
-                            print_info("Also saved as poster.jpg for Plex")
-                        else:
-                            print_error("Failed to download cover")
-                    else:
-                        print_warning("No cover image available")
-            else:
-                # Interactive: show options
-                print(f"\n  {Colors.BOLD}AniList results:{Colors.RESET}")
-                for i, result in enumerate(results[:5], 1):
-                    year = f"({result.year})" if result.year else ""
-                    eps = f"{result.episodes} eps" if result.episodes else ""
-                    print(f"    {i}. {result.display_title} {year} {eps}")
-
-                choice = input(f"\n  {Colors.BOLD}Select (1-5, or 's' to skip):{Colors.RESET} ").strip()
-
-                if choice.lower() != 's' and choice.isdigit():
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(results):
-                        selected = results[idx]
-                        if dry_run:
-                            print_info(f"Would download cover for: {selected.display_title}")
-                        elif selected.best_cover:
-                            success = await download_image(selected.best_cover, str(cover_path), str(poster_path))
-                            if success:
-                                print_success(f"Downloaded cover for: {selected.display_title}")
-                                print_info("Also saved as poster.jpg for Plex")
-                            else:
-                                print_error("Failed to download cover")
-                else:
-                    print_info("Skipped cover image")
 
     return True
 
@@ -600,22 +407,6 @@ async def process_plex_restructure(
             if result["errors"]:
                 for err in result["errors"]:
                     print_error(err)
-
-            # Download cover image
-            if selected_result and selected_result.best_cover and result["new_movie_path"]:
-                movie_path = Path(result["new_movie_path"])
-                cover_path = movie_path / "cover.jpg"
-                poster_path = movie_path / "poster.jpg"
-
-                if not cover_path.exists():
-                    success = await download_image(
-                        selected_result.best_cover,
-                        str(cover_path),
-                        str(poster_path)
-                    )
-                    if success:
-                        print_success(f"Downloaded cover for: {selected_result.display_title}")
-                        print_info("Also saved as poster.jpg for Plex")
         else:
             result = restructure_for_plex(str(folder), safe_name, year, season)
 
@@ -631,22 +422,6 @@ async def process_plex_restructure(
                 for err in result["errors"]:
                     print_error(err)
 
-            # Download cover image if we have AniList result
-            if selected_result and selected_result.best_cover and result["new_show_path"]:
-                show_path = Path(result["new_show_path"])
-                cover_path = show_path / "cover.jpg"
-                poster_path = show_path / "poster.jpg"
-
-                if not cover_path.exists():
-                    success = await download_image(
-                        selected_result.best_cover,
-                        str(cover_path),
-                        str(poster_path)
-                    )
-                    if success:
-                        print_success(f"Downloaded cover for: {selected_result.display_title}")
-                        print_info("Also saved as poster.jpg for Plex")
-
         return True
 
     except Exception as e:
@@ -656,15 +431,13 @@ async def process_plex_restructure(
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Clean anime folder/file names and fetch cover images",
+        description="Clean anime folder/file names and organize for Plex",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s /mnt/f/Media/Anime/              Interactive mode (recursive by default)
   %(prog)s --dry-run /mnt/f/Media/Anime/    Preview changes
   %(prog)s --auto /mnt/f/Media/Anime/       Auto mode (no prompts)
-  %(prog)s --images-only /path/to/anime          Only add images to folders missing them
-  %(prog)s --images-only --auto /path/to/anime   Auto-add images (no prompts)
   %(prog)s --plex-rename /path/to/anime          Restructure for Plex naming
   %(prog)s --plex-rename --auto /path/to/anime   Auto Plex restructure (no prompts)
   %(prog)s --no-recursive /path/to/anime         Only process top-level folders
@@ -676,8 +449,6 @@ Examples:
     parser.add_argument("--dry-run", "-n", action="store_true", help="Preview changes without applying them")
     parser.add_argument("--auto", "-a", action="store_true", help="Auto mode - no prompts, use detected names")
     parser.add_argument("--no-recursive", action="store_true", help="Don't process subfolders (recursive is on by default)")
-    parser.add_argument("--no-images", action="store_true", help="Skip fetching cover images")
-    parser.add_argument("--images-only", action="store_true", help="Only fetch images for folders missing cover.jpg (skip renaming)")
     parser.add_argument("--plex-rename", action="store_true", help="Restructure folders for Plex: Show (Year)/Season XX/Show (Year) - sXXeXX.ext")
     parser.add_argument("--movies-dir", type=Path, help="Directory for movies (default: sibling 'Movies' folder)")
     parser.add_argument("--force", "-f", action="store_true", help="Force processing even if folder appears already processed")
@@ -692,8 +463,6 @@ Examples:
     print(f"  Path: {path}")
     if args.plex_rename:
         mode_str = "Plex restructure"
-    elif args.images_only:
-        mode_str = "Images only"
     elif args.dry_run:
         mode_str = "Dry run"
     else:
@@ -701,8 +470,6 @@ Examples:
     print(f"  Mode: {mode_str}")
     print(f"  Prompts: {'Auto' if args.auto else 'Interactive'}")
     print(f"  Recursive: {'No' if args.no_recursive else 'Yes'}")
-    if not args.images_only and not args.plex_rename:
-        print(f"  Images: {'Skip' if args.no_images else 'Fetch'}")
 
     # Get folders to process
     if args.plex_rename:
@@ -713,16 +480,10 @@ Examples:
             if not args.force:
                 print_info("Tip: Use --force to process anyway")
             return
-    elif args.images_only:
-        folders = get_folders_missing_images(path, recursive=recursive)
-        if not folders:
-            print_warning("No folders missing cover images found")
-            return
     else:
         folders = get_folders_to_process(path, recursive=recursive)
         if not folders:
             print_warning("No folders with tags found to process")
-            print_info("Tip: Use --images-only to add images to already-clean folders")
             return
 
     print(f"\n  Found {len(folders)} folder(s) to process")
@@ -744,18 +505,11 @@ Examples:
                     auto=args.auto,
                     movies_dir=str(args.movies_dir) if args.movies_dir else None
                 )
-            elif args.images_only:
-                changed = await process_images_only(
-                    folder,
-                    dry_run=args.dry_run,
-                    auto=args.auto
-                )
             else:
                 changed = await process_folder(
                     folder,
                     dry_run=args.dry_run,
-                    auto=args.auto,
-                    fetch_images=not args.no_images
+                    auto=args.auto
                 )
             if changed:
                 processed += 1

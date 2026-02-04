@@ -17,6 +17,10 @@
             </div>
             <h1>AniGrab</h1>
             <p class="subtitle">Connect Mullvad first, then paste a link</p>
+            <div class="view-toggle">
+                <button id="download-view-btn" class="view-btn active">Download</button>
+                <button id="library-view-btn" class="view-btn">Library</button>
+            </div>
         </header>
 
         <!-- Input Section -->
@@ -166,21 +170,6 @@
                     </div>
                 </div>
 
-                <!-- Image selection -->
-                <div class="postprocess-group">
-                    <label>Cover Image:</label>
-                    <div class="image-grid" id="image-options">
-                        <!-- Images loaded dynamically -->
-                    </div>
-                    <div id="no-images-message" class="hidden">
-                        <p class="no-images-text">No images found</p>
-                    </div>
-                    <div class="image-search-row">
-                        <input type="text" id="image-search-input" placeholder="Search anime name..." />
-                        <button id="search-images-btn" class="btn secondary small">Search</button>
-                    </div>
-                </div>
-
                 <div class="button-group">
                     <button id="skip-postprocess" class="btn secondary">Skip</button>
                     <button id="apply-postprocess" class="btn primary">Apply</button>
@@ -202,6 +191,187 @@
             </div>
 
             <button id="new-download-btn" class="btn primary hidden">New Download</button>
+        </section>
+
+        <!-- Library Tools Section -->
+        <section id="library-section" class="card hidden">
+            <h2>Library Tools</h2>
+
+            <!-- Scan Options -->
+            <div class="library-options">
+                <div class="option-group">
+                    <label for="library-path">Scan Path:</label>
+                    <div class="path-input-row">
+                        <input type="text" id="library-path" placeholder="Leave empty for default ANIME_DIR" />
+                        <button id="scan-library-btn" class="btn primary small">Scan</button>
+                    </div>
+                </div>
+
+                <div class="option-toggles">
+                    <label class="toggle-label small">
+                        <input type="checkbox" id="scan-recursive" checked />
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Recursive</span>
+                    </label>
+                    <label class="toggle-label small">
+                        <input type="checkbox" id="scan-force" />
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Force</span>
+                    </label>
+                </div>
+
+                <div class="scan-type-selector">
+                    <label>Scan for:</label>
+                    <select id="scan-type">
+                        <option value="all">All issues</option>
+                        <option value="cleaning">Needs cleaning (has tags)</option>
+                        <option value="plex">Needs Plex restructure</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Scan Results -->
+            <div id="scan-results" class="hidden">
+                <div class="scan-summary">
+                    <span id="scan-path-display"></span>
+                    <div class="scan-counts">
+                        <span class="count-badge cleaning" id="count-cleaning">0 need cleaning</span>
+                        <span class="count-badge plex" id="count-plex">0 need Plex</span>
+                    </div>
+                </div>
+
+                <!-- Folder Tabs -->
+                <div class="folder-tabs">
+                    <button class="folder-tab active" data-tab="cleaning">Needs Cleaning</button>
+                    <button class="folder-tab" data-tab="plex">Needs Plex</button>
+                </div>
+
+                <!-- Folder Lists -->
+                <div id="folder-list-cleaning" class="folder-list"></div>
+                <div id="folder-list-plex" class="folder-list hidden"></div>
+
+                <!-- Batch Actions -->
+                <div class="batch-actions">
+                    <button id="select-all-btn" class="btn secondary small">Select All</button>
+                    <button id="deselect-all-btn" class="btn secondary small">Deselect All</button>
+                    <button id="preview-selected-btn" class="btn secondary">Preview Selected</button>
+                    <button id="process-selected-btn" class="btn primary">Process Selected</button>
+                </div>
+            </div>
+
+            <!-- Processing Options -->
+            <div id="processing-options" class="hidden">
+                <h3>Processing Options</h3>
+                <div class="option-toggles vertical">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="opt-plex-mode" checked />
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Use Plex naming format</span>
+                    </label>
+                </div>
+                <div class="option-group">
+                    <label for="opt-movies-dir">Movies Directory (for movies):</label>
+                    <input type="text" id="opt-movies-dir" placeholder="Leave empty for default" />
+                </div>
+            </div>
+
+            <!-- Preview Modal -->
+            <div id="preview-modal" class="modal hidden">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3>Preview Changes</h3>
+                        <button class="modal-close" id="close-preview">&times;</button>
+                    </div>
+                    <div class="modal-body" id="preview-content">
+                        <!-- Preview content loaded dynamically -->
+                    </div>
+                    <div class="modal-footer">
+                        <button id="cancel-preview-btn" class="btn secondary">Cancel</button>
+                        <button id="confirm-preview-btn" class="btn primary">Apply Changes</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Single Folder Edit Modal -->
+            <div id="edit-folder-modal" class="modal hidden">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3>Edit Folder</h3>
+                        <button class="modal-close" id="close-edit-folder">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="edit-folder-info">
+                            <p class="original-name">Original: <span id="edit-original-name"></span></p>
+                        </div>
+
+                        <div class="postprocess-group">
+                            <label for="edit-show-name">Show Name:</label>
+                            <input type="text" id="edit-show-name" />
+                        </div>
+
+                        <div class="postprocess-group" id="edit-season-group">
+                            <label for="edit-season">Season:</label>
+                            <input type="number" id="edit-season" value="1" min="1" max="99" />
+                        </div>
+
+                        <div class="postprocess-group">
+                            <label for="edit-year">Year (from AniList):</label>
+                            <div class="year-search-row">
+                                <span id="edit-year-display">-</span>
+                                <button id="search-anilist-btn" class="btn secondary small">Search AniList</button>
+                            </div>
+                        </div>
+
+                        <div class="postprocess-group">
+                            <label>AniList Match:</label>
+                            <div class="match-list" id="edit-image-options"></div>
+                            <div class="image-search-row">
+                                <input type="text" id="edit-image-search" placeholder="Search anime..." />
+                                <button id="edit-search-images-btn" class="btn secondary small">Search</button>
+                            </div>
+                        </div>
+
+                        <!-- Preview Section -->
+                        <div class="edit-preview">
+                            <div class="preview-header">
+                                <h4>Preview</h4>
+                                <button id="refresh-preview-btn" class="btn secondary small">Dry Run</button>
+                            </div>
+                            <div id="edit-preview-content"></div>
+                            <div id="edit-dry-run-content" class="hidden"></div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button id="cancel-edit-btn" class="btn secondary">Cancel</button>
+                        <button id="save-edit-btn" class="btn primary">Save & Process</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Processing Progress -->
+            <div id="library-progress" class="hidden">
+                <div class="progress-info">
+                    <span id="library-progress-text">Processing...</span>
+                </div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="library-progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="progress-stats">
+                    <span id="library-progress-count">0/0</span>
+                </div>
+            </div>
+
+            <!-- Results Summary -->
+            <div id="library-results" class="hidden">
+                <h3>Processing Complete</h3>
+                <div class="results-summary">
+                    <span class="result-stat success"><span id="result-processed">0</span> processed</span>
+                    <span class="result-stat failed"><span id="result-failed">0</span> failed</span>
+                    <span class="result-stat skipped"><span id="result-skipped">0</span> skipped</span>
+                </div>
+                <div id="results-details" class="results-details"></div>
+                <button id="library-done-btn" class="btn primary">Done</button>
+            </div>
         </section>
 
         <!-- System Status Footer -->

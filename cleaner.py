@@ -1,6 +1,6 @@
 """
 Anime name cleaning module.
-Removes release tags, quality markers, and other artifacts from folder/file names.
+Uses anitopy for parsing anime filenames and extracting metadata.
 """
 
 import os
@@ -8,133 +8,24 @@ import re
 import shutil
 from pathlib import Path
 
-
-# Patterns to remove (order matters - more specific patterns first)
-BRACKET_PATTERNS = [
-    # Release groups (common ones)
-    r'\[(?:SubsPlease|Erai-raws|MTBB|Tenrai-Sensei|ItachiUchiha|Exiled-Destiny|'
-    r'Judas|ASW|Commie|HorribleSubs|Cleo|ToonsHub|LostYears|Ember|ember|'
-    r'EMBER|Reaktor|Beatrice-Raws|Moozzi2|Kametsu|DHD|ANE|CTR|'
-    r'A-L|BakedFish|Golumpa|Pixel|Tsundere-Raws|Cerberus|SCY|ReinForce|'
-    r'Smoke|NC-Raws|Setsugen|Harunatsu|PAS|GJM|DB|Coalgirls|Vivid|'
-    r'FFF|UTW|Underwater|gg|Mazui|Chihiro|Hiryuu|WhyNot|Hatsuyuki)\]',
-
-    # Quality/format tags
-    r'\[(?:BD|DVD|WEB|TV|HDTV|BDRip|DVDRip|WEB-DL|WEBRip|WEBDL|'
-    r'BluRay|Blu-Ray|HDRip|AMZN|CR|DSNP|NF|HULU|VRV)\]',
-
-    # Resolution
-    r'\[(?:1080p|720p|480p|2160p|4K|UHD|FHD|HD)\]',
-
-    # Video codec
-    r'\[(?:HEVC|H\.265|H265|x265|x264|H\.264|H264|AV1|AVC|VP9|'
-    r'10bit|10-bit|8bit|Hi10P|Hi10|Main10)\]',
-
-    # Audio codec
-    r'\[(?:AAC|FLAC|AC3|DTS|EAC3|OPUS|MP3|TrueHD|Atmos|'
-    r'Dual[ -]?Audio|Multi[ -]?Audio|2\.0|5\.1|7\.1)\]',
-
-    # Misc tags
-    r'\[(?:Batch|Complete|FINAL|v2|v3|Uncensored|Uncut|'
-    r'Director\'?s?[ -]?Cut|Extended|Remaster(?:ed)?)\]',
-
-    # Generic bracketed content with common patterns
-    r'\[(?:\d+bit|\d+p|[xh]\.?\d{3})[^\]]*\]',
-]
-
-# Parentheses patterns
-PAREN_PATTERNS = [
-    # Quality in parens
-    r'\((?:BD|DVD|WEB|TV|1080p|720p|480p|2160p|4K)\s*[^)]*\)',
-    r'\((?:Dual[ -]?Audio|Multi[ -]?Audio)\)',
-]
-
-# Scene naming patterns (dots/underscores as separators)
-SCENE_PATTERNS = [
-    # Scene group at end (after resolution/codec)
-    r'[-.](?:EMBER|VARYG|YTS|RARBG|NTb|CtrlHD|EVO|FGT|SPARKS|'
-    r'TEPES|GECKOS|playWEB|FLUX|ION10|HONE|NTG|SMURF|EDITH|'
-    r'PSA|MeGusta|TORRENTGALAXY)$',
-
-    # Common scene tags (remove completely)
-    r'\.(?:WEB-DL|WEBRip|BluRay|BDRip|HDRip|HDTV)',
-    r'\.(?:x264|x265|HEVC|H\.?264|H\.?265|AVC|AV1)',
-    r'\.(?:AAC|FLAC|AC3|DTS|EAC3)(?:\d\.\d)?',
-    r'\.(?:1080p|720p|480p|2160p)',
-    r'\.(?:REPACK|PROPER|REAL)',
-
-    # ADN, CR, NF etc source tags
-    r'\.(?:ADN|CR|NF|AMZN|DSNP|HULU|ATVP|PCOK)',
-]
-
-# Patterns to remove from non-scene names (space separated)
-SPACE_PATTERNS = [
-    r'\b(?:1080p|720p|480p|2160p|4K)\b',
-    r'\b(?:WEB-DL|WEBRip|BluRay|BDRip|HDRip|HDTV)\b',
-    r'\b(?:x264|x265|HEVC|H\.?264|H\.?265|AVC|AV1)\b',
-    r'\b(?:AAC|FLAC|AC3|DTS|EAC3)(?:\d\.\d)?\b',
-    r'\b(?:Dual\s*Audio|Multi\s*Audio)\b',
-    r'\b(?:10\s*bits?|8\s*bits?)\b',
-    r'\bDD\b',
-]
-
-# Trailing junk
-TRAILING_PATTERNS = [
-    r'\s*[-_]\s*$',  # Trailing dashes/underscores
-    r'\s+$',  # Trailing whitespace
-]
+import anitopy
 
 
 def detect_anime_name(raw_name: str) -> str:
     """
-    Clean a torrent/folder name to extract the anime title.
-    Preserves season info (S1, Season 1, etc).
+    Clean a torrent/folder name to extract the anime title using anitopy.
     """
-    name = raw_name
+    parsed = anitopy.parse(raw_name)
+    title = parsed.get('anime_title', '')
 
-    # Remove file extension if present
-    name = re.sub(r'\.(mkv|mp4|avi|m4v|webm)$', '', name, flags=re.IGNORECASE)
+    if not title:
+        # Fallback: strip extension and basic cleanup
+        title = re.sub(r'\.(mkv|mp4|avi|m4v|webm)$', '', raw_name, flags=re.IGNORECASE)
+        title = re.sub(r'\[[^\]]+\]', '', title)  # Remove brackets
+        title = re.sub(r'\([^)]+\)', '', title)   # Remove parentheses
+        title = re.sub(r'\s+', ' ', title).strip(' -_.')
 
-    # Remove all bracketed content matching our patterns
-    for pattern in BRACKET_PATTERNS:
-        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
-
-    # Remove remaining brackets that look like tags (short content, all caps, or has numbers)
-    name = re.sub(r'\[[A-Z0-9][A-Za-z0-9 ._-]{0,20}\]', '', name)
-
-    # Remove parentheses patterns
-    for pattern in PAREN_PATTERNS:
-        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
-
-    # Handle scene naming (dots as word separators)
-    if '.' in name and ' ' not in name:
-        # This looks like scene naming, convert dots to spaces
-        for pattern in SCENE_PATTERNS:
-            name = re.sub(pattern, '', name, flags=re.IGNORECASE)
-        # Convert remaining dots to spaces (but not in "S01E01" patterns)
-        name = re.sub(r'\.(?![0-9])', ' ', name)
-
-    # Remove space-separated quality tags
-    for pattern in SPACE_PATTERNS:
-        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
-
-    # Clean up underscores
-    name = name.replace('_', ' ')
-
-    # Remove trailing group names (common pattern: "Name - GroupName" or "Name-GroupName")
-    name = re.sub(r'\s*[-]\s*[A-Za-z]+$', '', name)
-
-    # Clean up trailing junk
-    for pattern in TRAILING_PATTERNS:
-        name = re.sub(pattern, '', name)
-
-    # Normalize whitespace
-    name = re.sub(r'\s+', ' ', name).strip()
-
-    # Remove leading/trailing special chars
-    name = name.strip(' -_.')
-
-    return name
+    return title.strip()
 
 
 def clean_episode_name(filename: str, show_name: str = None) -> str:
@@ -142,31 +33,26 @@ def clean_episode_name(filename: str, show_name: str = None) -> str:
     Clean an episode filename while preserving episode numbering.
     If show_name is provided, uses it as the base name.
     """
-    # Get extension
-    ext_match = re.search(r'(\.[a-zA-Z0-9]{2,4})$', filename)
-    ext = ext_match.group(1) if ext_match else ''
-    name = filename[:-len(ext)] if ext else filename
+    parsed = anitopy.parse(filename)
+    ext = parsed.get('file_extension', '')
+    if ext:
+        ext = f'.{ext}'
 
-    # Try to find episode number patterns
-    ep_patterns = [
-        r'([-_ ](?:E|EP|Episode)?\s*(\d{1,4})(?:v\d)?)',  # - 01, E01, EP01, Episode 01
-        r'([-_ ]S\d{1,2}E(\d{1,4}))',  # S01E01
-        r'([-_ ](\d{1,4})(?:v\d)?[-_ ])',  # - 01 - (surrounded by separators)
-    ]
-
-    episode_num = None
-    for pattern in ep_patterns:
-        match = re.search(pattern, name, re.IGNORECASE)
-        if match:
-            episode_num = match.group(2) if len(match.groups()) > 1 else None
-            break
+    episode_num = parsed.get('episode_number')
 
     if show_name and episode_num:
-        # Reconstruct with clean show name
-        return f"{show_name} - {episode_num.zfill(2)}{ext}"
+        # Handle multi-episode (e.g., "01-03")
+        if isinstance(episode_num, list):
+            episode_num = episode_num[0]
+        return f"{show_name} - {str(episode_num).zfill(2)}{ext}"
 
     # Fall back to general cleaning
-    cleaned = detect_anime_name(name)
+    cleaned = parsed.get('anime_title', detect_anime_name(filename))
+    if episode_num:
+        if isinstance(episode_num, list):
+            episode_num = episode_num[0]
+        return f"{cleaned} - {str(episode_num).zfill(2)}{ext}"
+
     return f"{cleaned}{ext}"
 
 
@@ -236,16 +122,23 @@ def sanitize_filename(name: str) -> str:
 
 
 def needs_cleaning(name: str) -> bool:
-    """Check if a folder/file name has tags that need cleaning."""
-    # Has bracketed content
-    if re.search(r'\[[^\]]+\]', name):
+    """Check if a folder/file name has tags that need cleaning using anitopy."""
+    parsed = anitopy.parse(name)
+
+    # If anitopy found any of these, the name has tags that should be cleaned
+    has_tags = any([
+        parsed.get('release_group'),
+        parsed.get('video_resolution'),
+        parsed.get('video_term'),
+        parsed.get('audio_term'),
+        parsed.get('source'),
+        parsed.get('file_checksum'),
+    ])
+
+    if has_tags:
         return True
 
-    # Has parenthesized quality tags
-    if re.search(r'\((?:BD|DVD|WEB|1080p|720p|Dual)', name, re.IGNORECASE):
-        return True
-
-    # Looks like scene naming (many dots)
+    # Additional check: looks like scene naming (many dots, no spaces)
     if name.count('.') > 3 and ' ' not in name:
         return True
 
@@ -284,77 +177,91 @@ def extract_base_name_and_season(folder_name: str) -> tuple[str, int | None]:
 
 
 def detect_season_number(folder_name: str) -> int:
-    """Extract season number from folder name. Returns 1 if not found."""
-    # Roman numeral mapping (order matters - check longer ones first)
-    roman_numerals = ROMAN_NUMERALS
+    """Extract season number from folder name using anitopy. Returns 1 if not found."""
+    parsed = anitopy.parse(folder_name)
+    season = parsed.get('anime_season')
 
-    # Ordinal word to number mapping
+    if season:
+        # Handle array (e.g., S1+S2 returns ['1', '2'])
+        if isinstance(season, list):
+            season = season[0]
+        try:
+            return int(season)
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback: Check for Roman numerals (anitopy doesn't handle these)
+    roman_pattern = r'\b(XIII|XII|XI|IX|VIII|VII|VI|IV|III|II|X|V|I)(?:\b|[^a-zA-Z]|$)'
+    roman_match = re.search(roman_pattern, folder_name)
+    if roman_match:
+        numeral = roman_match.group(1)
+        if numeral in ROMAN_NUMERALS:
+            return ROMAN_NUMERALS[numeral]
+
+    # Fallback: Check for ordinal words
     ordinal_words = {
         'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
         'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10,
         '2nd': 2, '3rd': 3, '4th': 4, '5th': 5,
         '6th': 6, '7th': 7, '8th': 8, '9th': 9, '10th': 10,
     }
-
     name_lower = folder_name.lower()
-
-    # Check for Roman numerals (e.g., "Overlord II", "Konosuba III")
-    # Match at word boundary, typically at end or before brackets/parens
-    roman_pattern = r'\b(XIII|XII|XI|IX|VIII|VII|VI|IV|III|II|X|V|I)(?:\b|[^a-zA-Z]|$)'
-    roman_match = re.search(roman_pattern, folder_name)
-    if roman_match:
-        numeral = roman_match.group(1)
-        if numeral in roman_numerals:
-            return roman_numerals[numeral]
-
-    # Check for ordinal words (e.g., "Show Second", "Show Third Season")
     for word, num in ordinal_words.items():
         if word in name_lower:
             return num
-
-    # Match patterns like S1, S01, Season 1, Season 01
-    patterns = [
-        r'[Ss](\d{1,2})(?:[^0-9]|$)',  # S1, S01, s1
-        r'[Ss]eason\s*(\d{1,2})',  # Season 1, Season 01
-        r'(\d{1,2})(?:st|nd|rd|th)\s*[Ss]eason',  # 1st Season, 2nd Season
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, folder_name)
-        if match:
-            return int(match.group(1))
 
     return 1  # Default to season 1
 
 
 def detect_episode_info(filename: str) -> tuple[int | None, int | None]:
     """
-    Extract season and episode number from filename.
+    Extract season and episode number from filename using anitopy.
     Returns (season, episode) tuple. Values may be None if not found.
     """
-    # Remove extension
-    name = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', filename)
+    try:
+        parsed = anitopy.parse(filename)
+        season = parsed.get('anime_season')
+        episode = parsed.get('episode_number')
+    except (AttributeError, Exception):
+        # anitopy can fail on simple filenames, use fallbacks
+        parsed = {}
+        season = None
+        episode = None
 
-    # Try various patterns
-    patterns = [
-        # S01E01 format
-        (r'[Ss](\d{1,2})[Ee](\d{1,4})', lambda m: (int(m.group(1)), int(m.group(2)))),
-        # - 01, E01, EP01 format (episode only)
-        (r'[-_ ][Ee][Pp]?\.?\s*(\d{1,4})(?:v\d)?(?:[-_ \[]|$)', lambda m: (None, int(m.group(1)))),
-        # " - 01" or "_-_01" format (with spaces, underscores, or mixed)
-        (r'[-_ ]-[-_ ](\d{1,4})(?:v\d)?(?:[-_ \[(]|$)', lambda m: (None, int(m.group(1)))),
-        # "Episode 01" format
-        (r'[Ee]pisode\s*(\d{1,4})', lambda m: (None, int(m.group(1)))),
-        # Trailing number like "Show 01.mkv"
-        (r'[\s_](\d{2,4})(?:v\d)?$', lambda m: (None, int(m.group(1)))),
-    ]
+    # Handle arrays (multi-season or multi-episode)
+    if isinstance(season, list):
+        season = season[0]
+    if isinstance(episode, list):
+        episode = episode[0]
 
-    for pattern, extractor in patterns:
-        match = re.search(pattern, name)
+    # Fallback: Try regex for S##E## format (pre-renamed Plex files)
+    if not episode:
+        match = re.search(r'[Ss](\d{1,2})[Ee](\d{1,3})', filename)
         if match:
-            return extractor(match)
+            season = match.group(1)
+            episode = match.group(2)
 
-    return (None, None)
+    # Fallback: Simple format like "01 - Title.mkv" or "01_Title.mkv" at start of filename
+    if not episode:
+        # Remove extension first
+        name_no_ext = re.sub(r'\.(mkv|mp4|avi|m4v|webm|ass|srt|sub|ssa)$', '', filename, flags=re.IGNORECASE)
+        # Match episode number at the start: "01 - Title", "01_Title", "01. Title"
+        match = re.match(r'^(\d{1,3})\s*[-_\.]\s*', name_no_ext)
+        if match:
+            episode = match.group(1)
+
+    # Convert to int
+    try:
+        season = int(season) if season else None
+    except (ValueError, TypeError):
+        season = None
+
+    try:
+        episode = int(episode) if episode else None
+    except (ValueError, TypeError):
+        episode = None
+
+    return (season, episode)
 
 
 def create_plex_episode_name(show_name: str, year: int | None, season: int, episode: int, ext: str) -> str:
@@ -401,7 +308,8 @@ def restructure_for_plex(
     folder_path: str,
     show_name: str,
     year: int | None,
-    season: int | None = None
+    season: int | None = None,
+    library_dir: str | None = None
 ) -> dict:
     """
     Restructure a folder to Plex-compatible format.
@@ -414,6 +322,14 @@ def restructure_for_plex(
 
     If an existing show folder is found (e.g., "Show Name (2017)"), new seasons
     will be added to that folder instead of creating a new one.
+
+    Args:
+        folder_path: Path to the source folder
+        show_name: Clean show name
+        year: Release year (optional)
+        season: Season number (optional, will be detected if not provided)
+        library_dir: Target library directory. If provided, show folder will be
+                     created here instead of in the source folder's parent.
 
     Returns dict with results.
     """
@@ -481,7 +397,13 @@ def restructure_for_plex(
         if need_restructure:
             # Need to move files to proper structure
             # Find or create the proper show folder
-            base_dir = show_folder.parent  # Go up from "Overlord IV" to "Overlord"
+            # Use library_dir if provided, otherwise go up from show folder
+            if library_dir:
+                base_dir = Path(library_dir)
+                if not base_dir.exists():
+                    base_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                base_dir = show_folder.parent  # Go up from "Overlord IV" to "Overlord"
 
             if year:
                 target_show_name = f"{safe_show_name} ({year})"
@@ -548,18 +470,24 @@ def restructure_for_plex(
 
             try:
                 if file != new_file_path:
-                    file.rename(new_file_path)
+                    shutil.move(str(file), str(new_file_path))
                     results["files_renamed"].append({
                         "old": file.name,
                         "new": new_filename
                     })
             except Exception as e:
-                results["errors"].append(f"Failed to rename {file.name}: {e}")
+                results["errors"].append(f"Failed to move {file.name}: {e}")
 
         return results
 
     # Get parent directory (where show folders live)
-    parent_dir = folder.parent
+    # Use library_dir if provided, otherwise use folder's parent
+    if library_dir:
+        parent_dir = Path(library_dir)
+        if not parent_dir.exists():
+            parent_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        parent_dir = folder.parent
 
     # First, check if an existing show folder exists
     existing_show = find_existing_show_folder(parent_dir, safe_show_name)
@@ -634,13 +562,14 @@ def restructure_for_plex(
 
         try:
             if file != new_file_path:
-                file.rename(new_file_path)
+                # Use shutil.move to handle cross-filesystem moves
+                shutil.move(str(file), str(new_file_path))
                 results["files_renamed"].append({
                     "old": file.name,
                     "new": new_filename
                 })
         except Exception as e:
-            results["errors"].append(f"Failed to rename {file.name}: {e}")
+            results["errors"].append(f"Failed to move {file.name}: {e}")
 
     # Clean up original folder if different from target
     if folder != target_show_path and folder.exists():
@@ -866,15 +795,50 @@ if __name__ == "__main__":
         "The.All.devouring.Whale.S01.1080p.ADN.WEB-DL.AAC2.0.H.264-VARYG",
         "[Exiled-Destiny] Haibane Renmei",
         "The Eminence in Shadow (S1+S2) [BD] [AV1] [ItachiUchiha]",
-        "That Time I Got Reincarnated as a Slime S01-S02+OVA+SP...e Diaries 1080p Dual Audio BDRip 10 bits DD x265-EMBER",
         "[SubsPlease] Frieren - Beyond Journey's End - 01 (1080p) [ABC123].mkv",
         "Solo Leveling",
         "Made in Abyss Season 2",
+        "Overlord IV",
+        "[Judas] Konosuba II - 01.mkv",
     ]
 
-    print("Name Cleaning Test Results:")
-    print("=" * 60)
+    print("=" * 70)
+    print("ANITOPY-BASED CLEANER TEST RESULTS")
+    print("=" * 70)
+
+    print("\n--- detect_anime_name() ---")
     for name in test_names:
         cleaned = detect_anime_name(name)
-        print(f"\nOriginal: {name}")
-        print(f"Cleaned:  {cleaned}")
+        print(f"  {name}")
+        print(f"    -> {cleaned}\n")
+
+    print("\n--- detect_season_number() ---")
+    season_tests = [
+        "Made in Abyss Season 2",
+        "Overlord IV",
+        "Konosuba II",
+        "[MTBB] The Apothecary Diaries S1 (BD 1080p)",
+        "Attack on Titan Third Season",
+        "Solo Leveling",
+    ]
+    for name in season_tests:
+        season = detect_season_number(name)
+        print(f"  {name} -> Season {season}")
+
+    print("\n--- detect_episode_info() ---")
+    episode_tests = [
+        "[SubsPlease] Frieren - Beyond Journey's End - 01 (1080p) [ABC123].mkv",
+        "[Judas] Konosuba II - 01.mkv",
+        "Show.Name.S02E15.1080p.mkv",
+        "[Group] Show - 24v2.mkv",
+        "Show Name Episode 10.mkv",
+    ]
+    for name in episode_tests:
+        season, episode = detect_episode_info(name)
+        print(f"  {name}")
+        print(f"    -> Season: {season}, Episode: {episode}")
+
+    print("\n--- needs_cleaning() ---")
+    for name in test_names[:5]:
+        needs = needs_cleaning(name)
+        print(f"  {name[:50]}... -> {needs}")

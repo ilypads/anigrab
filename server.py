@@ -17,9 +17,11 @@ from qbittorrent import qbittorrent, QBTStatus
 from cleaner import (
     detect_anime_name, rename_folder, rename_files_in_folder,
     detect_season_number, restructure_for_plex, find_existing_show_folder,
-    detect_media_type, restructure_for_plex_movie
+    detect_media_type, restructure_for_plex_movie, needs_cleaning,
+    needs_plex_restructure, clean_episode_name, sanitize_filename,
+    detect_episode_info, create_plex_episode_name
 )
-from images import search_anilist, download_image
+from anilist import search_anilist, lookup_metadata
 
 app = FastAPI(title="AniGrab")
 
@@ -442,7 +444,8 @@ async def _download_generator(url: str) -> AsyncIterator[str]:
 @app.post("/api/post-process/detect")
 async def detect_post_process(request: Request):
     """
-    Detect clean name, season, media type, and fetch cover images from AniList.
+    Detect clean name, season, media type using anitopy parser.
+    Then lookup metadata from AniList for verification.
     Called after download completes.
     """
     body = await request.json()
@@ -466,7 +469,7 @@ async def detect_post_process(request: Request):
     # Detect media type (movie vs series)
     media_type = detect_media_type(torrent_name, file_count)
 
-    # Detect clean name and season
+    # Detect clean name and season using anitopy
     detected_name = detect_anime_name(torrent_name)
     detected_season = detect_season_number(torrent_name) if media_type == 'series' else None
 
@@ -478,9 +481,12 @@ async def detect_post_process(request: Request):
         if existing:
             existing_show = existing.name
 
-    # Search AniList for cover images
-    results = await search_anilist(detected_name)
-    images = [r.to_dict() for r in results[:5]]
+    # Lookup metadata from AniList for verification
+    anilist_results = await search_anilist(detected_name)
+    matches = [r.to_dict() for r in anilist_results[:5]]
+
+    # Get best match for auto-fill
+    best_match = matches[0] if matches else None
 
     return {
         "success": True,
@@ -490,19 +496,19 @@ async def detect_post_process(request: Request):
         "existing_show": existing_show,
         "original_name": torrent_name,
         "folder_path": folder_path,
-        "images": images
+        "anilist_matches": matches,
+        "best_match": best_match,
     }
 
 
 @app.post("/api/post-process/apply")
 async def apply_post_process(request: Request):
     """
-    Apply post-processing: rename folder/files and download cover image.
+    Apply post-processing: rename folder and files to clean names.
     """
     body = await request.json()
     folder_path = body.get("folder_path", "")
     new_name = body.get("new_name", "")
-    image_url = body.get("image_url")  # Optional
 
     if not folder_path or not new_name:
         return {"success": False, "error": "Missing folder_path or new_name"}
@@ -514,7 +520,6 @@ async def apply_post_process(request: Request):
     results = {
         "folder_renamed": False,
         "files_renamed": [],
-        "cover_saved": False,
         "new_path": folder_path
     }
 
@@ -530,23 +535,15 @@ async def apply_post_process(request: Request):
         renamed = rename_files_in_folder(str(folder), new_name)
         results["files_renamed"] = [{"old": old, "new": new} for old, new in renamed]
 
-        # Download cover image (and poster.jpg for Plex)
-        if image_url:
-            cover_path = folder / "cover.jpg"
-            poster_path = folder / "poster.jpg"  # For Plex compatibility
-            if not cover_path.exists():
-                success = await download_image(image_url, str(cover_path), str(poster_path))
-                results["cover_saved"] = success
-
         return {"success": True, "results": results}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/post-process/search-images")
-async def search_images(request: Request):
-    """Search AniList for images with a custom query."""
+@app.post("/api/anilist/search")
+async def search_anilist_metadata(request: Request):
+    """Search AniList for anime metadata with a custom query."""
     body = await request.json()
     query = body.get("query", "")
 
@@ -554,9 +551,9 @@ async def search_images(request: Request):
         return {"success": False, "error": "No query provided"}
 
     results = await search_anilist(query)
-    images = [r.to_dict() for r in results[:10]]
+    matches = [r.to_dict() for r in results[:10]]
 
-    return {"success": True, "images": images}
+    return {"success": True, "matches": matches}
 
 
 @app.post("/api/post-process/plex-restructure")
@@ -570,7 +567,6 @@ async def plex_restructure(request: Request):
     show_name = body.get("show_name", "")
     year = body.get("year")  # Optional, from AniList
     season = body.get("season")  # Optional, will detect if not provided
-    image_url = body.get("image_url")  # Optional, cover image
 
     if not folder_path or not show_name:
         return {"success": False, "error": "Missing folder_path or show_name"}
@@ -584,18 +580,17 @@ async def plex_restructure(request: Request):
         if season is None:
             season = detect_season_number(folder.name)
 
-        # Perform restructure
-        result = restructure_for_plex(str(folder), show_name, year, season)
+        # Auto-lookup year from AniList if not provided
+        if year is None:
+            try:
+                matches = await search_anilist(show_name)
+                if matches:
+                    year = matches[0].year
+            except Exception:
+                pass  # Continue without year if lookup fails
 
-        # Download cover image if provided and new show path exists
-        if image_url and result.get("new_show_path"):
-            show_path = Path(result["new_show_path"])
-            cover_path = show_path / "cover.jpg"
-            poster_path = show_path / "poster.jpg"
-
-            if not cover_path.exists():
-                cover_success = await download_image(image_url, str(cover_path), str(poster_path))
-                result["cover_saved"] = cover_success
+        # Perform restructure - use anime_dir if configured
+        result = restructure_for_plex(str(folder), show_name, year, season, config.anime_dir)
 
         return {"success": True, "results": result}
 
@@ -613,13 +608,13 @@ async def movie_restructure(request: Request):
     folder_path = body.get("folder_path", "")
     movie_name = body.get("movie_name", "")
     year = body.get("year")  # Optional, from AniList
-    image_url = body.get("image_url")  # Optional, cover image
+    movies_dir_override = body.get("movies_dir")  # Optional override
 
     if not folder_path or not movie_name:
         return {"success": False, "error": "Missing folder_path or movie_name"}
 
-    # Get movies directory from config or use default
-    movies_dir = config.movies_dir
+    # Get movies directory from override, config, or default
+    movies_dir = movies_dir_override or config.movies_dir
     if not movies_dir:
         # Default to sibling "Movies" folder of anime_dir
         if config.anime_dir:
@@ -635,20 +630,363 @@ async def movie_restructure(request: Request):
         # Perform movie restructure
         result = restructure_for_plex_movie(str(folder), movie_name, year, movies_dir)
 
-        # Download cover image if provided and new movie path exists
-        if image_url and result.get("new_movie_path"):
-            movie_path = Path(result["new_movie_path"])
-            cover_path = movie_path / "cover.jpg"
-            poster_path = movie_path / "poster.jpg"
-
-            if not cover_path.exists():
-                cover_success = await download_image(image_url, str(cover_path), str(poster_path))
-                result["cover_saved"] = cover_success
-
         return {"success": True, "results": result}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@app.post("/api/library/scan")
+async def scan_library(request: Request):
+    """
+    Scan a directory for folders that need processing.
+    Returns folders grouped by type: needs_cleaning, needs_plex_restructure.
+    """
+    body = await request.json()
+    scan_path = body.get("path", "")
+    recursive = body.get("recursive", True)
+    scan_type = body.get("type", "all")  # all, cleaning, plex
+    force = body.get("force", False)
+
+    if not scan_path:
+        # Default to anime_dir from config
+        scan_path = config.anime_dir
+        if not scan_path:
+            return {"success": False, "error": "No path provided and ANIME_DIR not configured"}
+
+    path = Path(scan_path)
+    if not path.exists():
+        return {"success": False, "error": f"Path not found: {scan_path}"}
+
+    if not path.is_dir():
+        return {"success": False, "error": f"Path is not a directory: {scan_path}"}
+
+    results = {
+        "path": str(path),
+        "needs_cleaning": [],
+        "needs_plex_restructure": [],
+    }
+
+    media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
+
+    def scan_dir(dir_path: Path, depth: int = 0):
+        """Recursively scan for folders needing processing."""
+        max_depth = 3 if recursive else 0
+
+        for item in sorted(dir_path.iterdir()):
+            if item.is_dir():
+                # Check if folder has media files
+                has_media = any(
+                    f.suffix.lower() in media_extensions
+                    for f in item.iterdir() if f.is_file()
+                )
+
+                if has_media:
+                    folder_info = {
+                        "path": str(item),
+                        "name": item.name,
+                        "detected_name": detect_anime_name(item.name),
+                    }
+
+                    # Check what processing is needed
+                    if scan_type in ("all", "cleaning") and needs_cleaning(item.name):
+                        folder_info["detected_season"] = detect_season_number(item.name)
+                        results["needs_cleaning"].append(folder_info.copy())
+
+                    if scan_type in ("all", "plex") and (force or needs_plex_restructure(str(item))):
+                        file_count = sum(1 for f in item.iterdir() if f.is_file() and f.suffix.lower() in media_extensions)
+                        folder_info["media_type"] = detect_media_type(item.name, file_count)
+                        folder_info["detected_season"] = detect_season_number(item.name) if folder_info["media_type"] == "series" else None
+                        results["needs_plex_restructure"].append(folder_info.copy())
+
+                # Recurse into subdirectories
+                if depth < max_depth:
+                    scan_dir(item, depth + 1)
+
+    # Scan the directory
+    scan_dir(path, depth=0)
+
+    # Sort by depth (deepest first for cleaning operations)
+    for key in ("needs_cleaning", "needs_plex_restructure"):
+        results[key].sort(key=lambda x: len(Path(x["path"]).parts), reverse=True)
+
+    return {
+        "success": True,
+        "results": results,
+        "counts": {
+            "needs_cleaning": len(results["needs_cleaning"]),
+            "needs_plex_restructure": len(results["needs_plex_restructure"]),
+        }
+    }
+
+
+@app.post("/api/library/preview")
+async def preview_changes(request: Request):
+    """
+    Preview changes for a folder without applying them (dry-run mode).
+    Returns detailed preview of what would happen.
+    """
+    body = await request.json()
+    folder_path = body.get("folder_path", "")
+    mode = body.get("mode", "standard")  # standard, plex
+    show_name = body.get("show_name")
+    year = body.get("year")
+    season = body.get("season")
+    movies_dir = body.get("movies_dir")
+
+    if not folder_path:
+        return {"success": False, "error": "No folder_path provided"}
+
+    folder = Path(folder_path)
+    if not folder.exists():
+        return {"success": False, "error": f"Folder not found: {folder_path}"}
+
+    media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
+    subtitle_extensions = {'.ass', '.srt', '.sub', '.ssa'}
+    all_extensions = media_extensions | subtitle_extensions
+
+    # Get file count for media type detection
+    file_count = sum(1 for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_extensions)
+
+    # Detect names if not provided
+    if not show_name:
+        show_name = detect_anime_name(folder.name)
+
+    media_type = detect_media_type(folder.name, file_count)
+
+    if season is None and media_type == "series":
+        season = detect_season_number(folder.name)
+
+    safe_name = sanitize_filename(show_name)
+
+    preview = {
+        "mode": mode,
+        "detected_name": show_name,
+        "detected_season": season,
+        "media_type": media_type,
+        "folder_rename": None,
+        "file_renames": [],
+        "structure_changes": [],
+    }
+
+    if mode == "plex":
+        # Plex restructure preview
+        if year:
+            new_folder_name = f"{safe_name} ({year})"
+        else:
+            new_folder_name = safe_name
+
+        if media_type == "movie":
+            # Movie restructure preview
+            target_movies_dir = movies_dir or config.movies_dir
+            if not target_movies_dir and config.anime_dir:
+                target_movies_dir = str(Path(config.anime_dir).parent / "Movies")
+
+            preview["structure_changes"].append({
+                "type": "create_folder",
+                "path": f"{target_movies_dir}/{new_folder_name}/"
+            })
+
+            # Find largest media file (the movie)
+            movie_files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_extensions]
+            if movie_files:
+                movie_file = max(movie_files, key=lambda f: f.stat().st_size)
+                new_filename = f"{new_folder_name}{movie_file.suffix}"
+                preview["file_renames"].append({
+                    "old": movie_file.name,
+                    "new": new_filename,
+                    "action": "move"
+                })
+        else:
+            # Series restructure preview
+            season_folder_name = f"Season {season:02d}"
+
+            # Check for existing show folder
+            existing_show = find_existing_show_folder(folder.parent, safe_name)
+            if existing_show and existing_show != folder:
+                preview["structure_changes"].append({
+                    "type": "use_existing",
+                    "path": str(existing_show)
+                })
+                new_folder_name = existing_show.name
+                # Extract year from existing folder for episode naming
+                import re
+                year_match = re.match(r'^(.+?)\s*\((\d{4})\)$', existing_show.name)
+                if year_match:
+                    year = int(year_match.group(2))
+            else:
+                preview["structure_changes"].append({
+                    "type": "create_folder",
+                    "path": f"{folder.parent}/{new_folder_name}/"
+                })
+
+            preview["structure_changes"].append({
+                "type": "create_season",
+                "path": f"{new_folder_name}/{season_folder_name}/"
+            })
+
+            # Preview file renames
+            for file in sorted(folder.iterdir()):
+                if file.is_file() and file.suffix.lower() in all_extensions:
+                    _, episode = detect_episode_info(file.name)
+                    if episode:
+                        new_filename = create_plex_episode_name(safe_name, year, season, episode, file.suffix)
+                        preview["file_renames"].append({
+                            "old": file.name,
+                            "new": new_filename,
+                            "action": "move"
+                        })
+                    else:
+                        preview["file_renames"].append({
+                            "old": file.name,
+                            "new": None,
+                            "action": "skip",
+                            "reason": "Could not detect episode number"
+                        })
+
+    else:
+        # Standard cleaning preview
+        if folder.name != safe_name:
+            preview["folder_rename"] = {
+                "old": folder.name,
+                "new": safe_name
+            }
+
+        # Preview file renames
+        for file in sorted(folder.iterdir()):
+            if file.is_file() and file.suffix.lower() in media_extensions:
+                new_name = clean_episode_name(file.name, safe_name)
+                if new_name != file.name:
+                    preview["file_renames"].append({
+                        "old": file.name,
+                        "new": new_name,
+                        "action": "rename"
+                    })
+
+    return {"success": True, "preview": preview}
+
+
+@app.post("/api/library/batch")
+async def batch_process(request: Request):
+    """
+    Process multiple folders in batch.
+    """
+    body = await request.json()
+    folders = body.get("folders", [])  # List of folder configs
+    mode = body.get("mode", "standard")  # standard, plex
+    movies_dir = body.get("movies_dir")
+
+    if not folders:
+        return {"success": False, "error": "No folders provided"}
+
+    results = {
+        "processed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "details": []
+    }
+
+    for folder_config in folders:
+        folder_path = folder_config.get("path", "")
+        show_name = folder_config.get("show_name")
+        year = folder_config.get("year")
+        season = folder_config.get("season")
+
+        if not folder_path:
+            results["skipped"] += 1
+            results["details"].append({
+                "path": folder_path,
+                "status": "skipped",
+                "reason": "No path provided"
+            })
+            continue
+
+        folder = Path(folder_path)
+        if not folder.exists():
+            results["failed"] += 1
+            results["details"].append({
+                "path": folder_path,
+                "status": "failed",
+                "reason": "Folder not found"
+            })
+            continue
+
+        try:
+            # Auto-detect if not provided
+            if not show_name:
+                show_name = detect_anime_name(folder.name)
+
+            media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
+            file_count = sum(1 for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_extensions)
+            media_type = detect_media_type(folder.name, file_count)
+
+            if season is None and media_type == "series":
+                season = detect_season_number(folder.name)
+
+            # Auto-lookup year from AniList if not provided (for Plex mode)
+            if year is None and mode == "plex":
+                try:
+                    matches = await search_anilist(show_name)
+                    if matches:
+                        year = matches[0].year
+                except Exception:
+                    pass  # Continue without year if lookup fails
+
+            if mode == "plex":
+                # Plex restructure
+                if media_type == "movie":
+                    target_movies_dir = movies_dir or config.movies_dir
+                    if not target_movies_dir and config.anime_dir:
+                        target_movies_dir = str(Path(config.anime_dir).parent / "Movies")
+
+                    if not target_movies_dir:
+                        results["failed"] += 1
+                        results["details"].append({
+                            "path": folder_path,
+                            "status": "failed",
+                            "reason": "Movies directory not configured"
+                        })
+                        continue
+
+                    result = restructure_for_plex_movie(str(folder), show_name, year, target_movies_dir)
+                else:
+                    result = restructure_for_plex(str(folder), show_name, year, season, config.anime_dir)
+
+                results["processed"] += 1
+                results["details"].append({
+                    "path": folder_path,
+                    "status": "success",
+                    "result": result
+                })
+
+            else:
+                # Standard cleaning
+                safe_name = sanitize_filename(show_name)
+                new_path = folder_path
+
+                if folder.name != safe_name:
+                    new_path = rename_folder(str(folder), safe_name)
+                    folder = Path(new_path)
+
+                renamed_files = rename_files_in_folder(str(folder), safe_name)
+
+                results["processed"] += 1
+                results["details"].append({
+                    "path": folder_path,
+                    "status": "success",
+                    "new_path": new_path,
+                    "files_renamed": len(renamed_files)
+                })
+
+        except Exception as e:
+            results["failed"] += 1
+            results["details"].append({
+                "path": folder_path,
+                "status": "failed",
+                "reason": str(e)
+            })
+
+    return {"success": True, "results": results}
 
 
 def _is_valid_link(url: str) -> bool:

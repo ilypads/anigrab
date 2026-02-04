@@ -1,11 +1,11 @@
 """
-Image fetching module using AniList API.
+AniList metadata lookup module.
+Used to verify/lookup anime metadata (title, year) for Plex folder naming.
 """
 
 import asyncio
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 import aiohttp
 
@@ -17,7 +17,6 @@ def clean_for_search(name: str) -> str:
     """
     Clean anime name for AniList search by removing season info and other artifacts.
     """
-    # Remove season patterns
     patterns = [
         r'\s*\(S\d+(?:\+S\d+)*\)',  # (S1), (S1+S2)
         r'\s*S\d{1,2}$',            # S01 at end
@@ -25,6 +24,8 @@ def clean_for_search(name: str) -> str:
         r'\s*Part\s*\d+',           # Part 1, Part 2
         r'\s*Cour\s*\d+',           # Cour 1, Cour 2
         r'\s*\d{1,2}(?:st|nd|rd|th)\s*Season',  # 2nd Season
+        # Roman numerals at end
+        r'\s+(XIII|XII|XI|IX|VIII|VII|VI|IV|III|II|X|V|I)$',
     ]
 
     result = name
@@ -33,7 +34,7 @@ def clean_for_search(name: str) -> str:
 
     return result.strip()
 
-# GraphQL query for searching anime
+
 SEARCH_QUERY = """
 query ($search: String) {
   Page(page: 1, perPage: 10) {
@@ -44,16 +45,13 @@ query ($search: String) {
         english
         native
       }
-      coverImage {
-        extraLarge
-        large
-        medium
-      }
-      bannerImage
       format
       status
       seasonYear
       episodes
+      startDate {
+        year
+      }
     }
   }
 }
@@ -61,27 +59,23 @@ query ($search: String) {
 
 
 @dataclass
-class AnimeResult:
+class AnimeMetadata:
     id: int
     title_romaji: str
     title_english: str | None
     title_native: str | None
-    cover_large: str | None
-    cover_extra_large: str | None
-    banner: str | None
-    format: str | None
+    format: str | None  # TV, MOVIE, OVA, ONA, SPECIAL, etc.
     year: int | None
     episodes: int | None
 
     @property
-    def best_cover(self) -> str | None:
-        """Return the highest quality cover available."""
-        return self.cover_extra_large or self.cover_large
+    def display_title(self) -> str:
+        """Return the best title for display (prefer English)."""
+        return self.title_english or self.title_romaji
 
     @property
-    def display_title(self) -> str:
-        """Return the best title for display."""
-        return self.title_english or self.title_romaji
+    def is_movie(self) -> bool:
+        return self.format == "MOVIE"
 
     def to_dict(self) -> dict:
         return {
@@ -89,20 +83,18 @@ class AnimeResult:
             "title": self.display_title,
             "title_romaji": self.title_romaji,
             "title_english": self.title_english,
-            "cover_url": self.best_cover,
-            "banner_url": self.banner,
             "format": self.format,
             "year": self.year,
             "episodes": self.episodes,
+            "is_movie": self.is_movie,
         }
 
 
-async def search_anilist(anime_name: str) -> list[AnimeResult]:
+async def search_anilist(anime_name: str) -> list[AnimeMetadata]:
     """
     Search AniList for anime matching the given name.
-    Returns a list of matching anime with cover images.
+    Returns a list of matching anime with metadata.
     """
-    # Clean the name for better search results
     search_query = clean_for_search(anime_name)
 
     async with aiohttp.ClientSession() as session:
@@ -123,19 +115,20 @@ async def search_anilist(anime_name: str) -> list[AnimeResult]:
 
                 results = []
                 for media in media_list:
-                    cover = media.get("coverImage", {})
                     title = media.get("title", {})
+                    # Use seasonYear first, fallback to startDate.year
+                    year = media.get("seasonYear")
+                    if not year:
+                        start_date = media.get("startDate", {})
+                        year = start_date.get("year") if start_date else None
 
-                    results.append(AnimeResult(
+                    results.append(AnimeMetadata(
                         id=media.get("id"),
                         title_romaji=title.get("romaji", "Unknown"),
                         title_english=title.get("english"),
                         title_native=title.get("native"),
-                        cover_large=cover.get("large"),
-                        cover_extra_large=cover.get("extraLarge"),
-                        banner=media.get("bannerImage"),
                         format=media.get("format"),
-                        year=media.get("seasonYear"),
+                        year=year,
                         episodes=media.get("episodes"),
                     ))
 
@@ -146,74 +139,18 @@ async def search_anilist(anime_name: str) -> list[AnimeResult]:
             return []
 
 
-async def download_image(url: str, save_path: str, also_save_as: str | None = None) -> bool:
+async def lookup_metadata(anime_name: str) -> AnimeMetadata | None:
     """
-    Download an image from URL and save it to the specified path.
-    Optionally saves a copy to also_save_as (for Plex poster.jpg compatibility).
-    Returns True on success.
-    """
-    save_path = Path(save_path)
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return False
-
-                # Read image data once
-                image_data = await resp.read()
-
-                # Ensure parent directory exists
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # Write the image
-                with open(save_path, 'wb') as f:
-                    f.write(image_data)
-
-                # Also save as poster.jpg if requested
-                if also_save_as:
-                    also_path = Path(also_save_as)
-                    with open(also_path, 'wb') as f:
-                        f.write(image_data)
-
-                # Also save as folder.jpg (another Plex Local Media Assets convention)
-                folder_jpg = save_path.parent / "folder.jpg"
-                with open(folder_jpg, 'wb') as f:
-                    f.write(image_data)
-
-                return True
-
-        except Exception as e:
-            print(f"Image download error: {e}")
-            return False
-
-
-async def fetch_and_save_cover(anime_name: str, folder_path: str) -> tuple[bool, str | None]:
-    """
-    Search for anime on AniList and save the first result's cover image.
-    Returns (success, cover_path).
+    Look up metadata for an anime. Returns the best match or None.
     """
     results = await search_anilist(anime_name)
-    if not results:
-        return False, None
-
-    # Use the first (most popular) result
-    best_match = results[0]
-    cover_url = best_match.best_cover
-
-    if not cover_url:
-        return False, None
-
-    cover_path = Path(folder_path) / "cover.jpg"
-    success = await download_image(cover_url, str(cover_path))
-
-    return success, str(cover_path) if success else None
+    return results[0] if results else None
 
 
 # Test
 if __name__ == "__main__":
     async def test():
-        print("Testing AniList search...")
+        print("Testing AniList metadata lookup...")
 
         test_names = [
             "The Apothecary Diaries",
@@ -221,6 +158,7 @@ if __name__ == "__main__":
             "Frieren",
             "Made in Abyss",
             "Solo Leveling",
+            "Overlord",
         ]
 
         for name in test_names:
@@ -228,8 +166,8 @@ if __name__ == "__main__":
             results = await search_anilist(name)
             if results:
                 top = results[0]
-                print(f"  Top result: {top.display_title} ({top.year})")
-                print(f"  Cover: {top.best_cover}")
+                print(f"  Match: {top.display_title} ({top.year})")
+                print(f"  Format: {top.format}, Episodes: {top.episodes}")
             else:
                 print("  No results found")
 
