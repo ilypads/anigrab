@@ -741,16 +741,29 @@ function renderQueue() {
             progress.textContent = '-';
         }
 
+        const actions = document.createElement('div');
+        actions.className = 'queue-actions';
+
+        if (job.status === 'error' || job.status === 'cancelled') {
+            const retryBtn = document.createElement('button');
+            retryBtn.className = 'queue-retry-btn';
+            retryBtn.innerHTML = '&#8635;';
+            retryBtn.title = 'Retry';
+            retryBtn.addEventListener('click', () => retryJob(job.id));
+            actions.appendChild(retryBtn);
+        }
+
         const removeBtn = document.createElement('button');
         removeBtn.className = 'queue-remove-btn';
         removeBtn.innerHTML = '&times;';
         removeBtn.title = 'Remove from queue';
         removeBtn.addEventListener('click', () => removeFromQueue(job.id));
+        actions.appendChild(removeBtn);
 
         item.appendChild(position);
         item.appendChild(info);
         item.appendChild(progress);
-        item.appendChild(removeBtn);
+        item.appendChild(actions);
         queueList.appendChild(item);
     });
 
@@ -813,12 +826,35 @@ async function addToQueue() {
     }
 }
 
+async function retryJob(jobId) {
+    try {
+        const response = await fetch('/api/queue/retry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: jobId })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            // Auto-start the queue if not already processing
+            if (!isQueueProcessing) {
+                await startQueueProcessing();
+            }
+        } else {
+            alert('Failed to retry: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Failed to retry job:', error);
+    }
+}
+
 async function removeFromQueue(jobId) {
     try {
         const response = await fetch('/api/queue/remove', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ job_id: jobId })
+            body: JSON.stringify({ id: jobId })
         });
 
         const data = await response.json();

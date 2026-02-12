@@ -545,6 +545,32 @@ async def remove_from_queue(request: Request):
     return {"success": False, "error": "Job not found"}
 
 
+@app.post("/api/queue/retry")
+async def retry_job(request: Request):
+    """Retry a failed or cancelled job by resetting it to pending."""
+    body = await request.json()
+    job_id = body.get("id", "")
+
+    if not job_id:
+        return {"success": False, "error": "No job ID provided"}
+
+    async with queue_lock:
+        for job in job_queue:
+            if job.id == job_id:
+                if job.status not in ("error", "cancelled"):
+                    return {"success": False, "error": "Can only retry failed or cancelled jobs"}
+                job.status = "pending"
+                job.progress = 0
+                job.error_message = None
+                job.started_at = None
+                job.completed_at = None
+                job.torrent_hash = None
+                await broadcast_queue_update("job_retry", job)
+                return {"success": True, "job": job.to_dict()}
+
+    return {"success": False, "error": "Job not found"}
+
+
 @app.post("/api/queue/clear")
 async def clear_queue():
     """Clear completed and failed jobs from the queue."""

@@ -765,9 +765,7 @@ footer {
     font-size: 0.85rem;
     color: var(--text-primary);
     display: block;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    word-break: break-word;
     margin-bottom: 4px;
 }
 
@@ -802,7 +800,14 @@ footer {
     color: var(--success);
 }
 
-.queue-remove-btn {
+.queue-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.queue-remove-btn,
+.queue-retry-btn {
     background: none;
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -822,6 +827,12 @@ footer {
     border-color: var(--error);
     color: var(--error);
     background: rgba(232, 138, 138, 0.1);
+}
+
+.queue-retry-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(139, 180, 232, 0.1);
 }
 
 .queue-summary {
