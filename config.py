@@ -28,12 +28,6 @@ class Config:
     # Download directory (where qBittorrent saves files)
     download_dir: str = ""
 
-    # Anime directory (for post-processing and CLI - TV series)
-    anime_dir: str = ""
-
-    # Anime Movies directory (for post-processing movies)
-    movies_dir: str = ""
-
     # Path to qBittorrent executable (for restart functionality)
     qbt_executable: str = ""
 
@@ -63,8 +57,6 @@ class Config:
             qbt_username=os.getenv("QBT_USERNAME", "admin"),
             qbt_password=os.getenv("QBT_PASSWORD", "adminadmin"),
             download_dir=os.getenv("DOWNLOAD_DIR", ""),
-            anime_dir=os.getenv("ANIME_DIR", ""),
-            movies_dir=os.getenv("MOVIES_DIR", ""),
             qbt_executable=qbt_exe,
         )
 

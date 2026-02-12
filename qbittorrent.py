@@ -288,11 +288,13 @@ class QBittorrentClient:
     def _map_state(self, state: str) -> QBTStatus:
         """Map qBittorrent state string to QBTStatus enum."""
         state = state.lower()
-        if state in ("downloading", "forcedup", "metadl", "allocating"):
+        if state in ("downloading", "forcedup", "metadl", "allocating", "stalleddl"):
             return QBTStatus.DOWNLOADING
         elif state in ("uploading", "forceup", "stalledup"):
             return QBTStatus.SEEDING
         elif state in ("pauseddl", "pausedup", "paused"):
+            return QBTStatus.PAUSED
+        elif state in ("stoppeddl", "stoppedup"):
             return QBTStatus.PAUSED
         elif state in ("queueddl", "queuedup"):
             return QBTStatus.QUEUED
@@ -300,8 +302,6 @@ class QBittorrentClient:
             return QBTStatus.CHECKING
         elif state in ("error", "missingfiles"):
             return QBTStatus.ERROR
-        elif state in ("stalleddl",):
-            return QBTStatus.DOWNLOADING
         else:
             return QBTStatus.UNKNOWN
 

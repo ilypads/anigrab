@@ -2,7 +2,10 @@ import asyncio
 import json
 import os
 import re
+import time
 import urllib.parse
+import uuid
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -10,23 +13,57 @@ import aiohttp
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import config
+from constants import VIDEO_EXTENSIONS, SUBTITLE_EXTENSIONS, MEDIA_EXTENSIONS
 from mullvad import mullvad, MullvadStatus
 from qbittorrent import qbittorrent, QBTStatus
-from cleaner import (
-    detect_anime_name, rename_folder, rename_files_in_folder,
-    detect_season_number, restructure_for_plex, find_existing_show_folder,
-    detect_media_type, restructure_for_plex_movie, needs_cleaning,
-    needs_plex_restructure, clean_episode_name, sanitize_filename,
-    detect_episode_info, create_plex_episode_name
-)
-from anilist import search_anilist, lookup_metadata
 
 app = FastAPI(title="AniGrab")
 
+
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
+
+app.add_middleware(NoCacheStaticMiddleware)
+
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ============== Job Queue System ==============
+
+@dataclass
+class QueuedJob:
+    """Represents a queued download job."""
+    id: str
+    url: str
+    title: str
+    status: str = "pending"  # pending, downloading, complete, error, cancelled
+    progress: float = 0.0
+    torrent_hash: str | None = None
+    folder_path: str | None = None
+    error_message: str | None = None
+    added_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    completed_at: float | None = None
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# Queue state
+job_queue: list[QueuedJob] = []
+queue_lock = asyncio.Lock()
+queue_active = False
+queue_task: asyncio.Task | None = None
+queue_sse_clients: list[asyncio.Queue] = []
 
 
 def sse_message(event: str, data: dict) -> str:
@@ -441,552 +478,240 @@ async def _download_generator(url: str) -> AsyncIterator[str]:
         })
 
 
-@app.post("/api/post-process/detect")
-async def detect_post_process(request: Request):
-    """
-    Detect clean name, season, media type using anitopy parser.
-    Then lookup metadata from AniList for verification.
-    Called after download completes.
-    """
-    body = await request.json()
-    torrent_name = body.get("torrent_name", "")
-    folder_path = body.get("folder_path", "")
+# ============== Queue Endpoints ==============
 
-    if not torrent_name:
-        return {"success": False, "error": "No torrent name provided"}
-
-    # Count media files if folder path provided
-    file_count = 0
-    if folder_path:
-        folder = Path(folder_path)
-        if folder.exists():
-            media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
-            file_count = len([
-                f for f in folder.iterdir()
-                if f.is_file() and f.suffix.lower() in media_extensions
-            ])
-
-    # Detect media type (movie vs series)
-    media_type = detect_media_type(torrent_name, file_count)
-
-    # Detect clean name and season using anitopy
-    detected_name = detect_anime_name(torrent_name)
-    detected_season = detect_season_number(torrent_name) if media_type == 'series' else None
-
-    # Check for existing show folder (for series)
-    existing_show = None
-    if media_type == 'series' and folder_path:
-        folder = Path(folder_path)
-        existing = find_existing_show_folder(folder.parent, detected_name)
-        if existing:
-            existing_show = existing.name
-
-    # Lookup metadata from AniList for verification
-    anilist_results = await search_anilist(detected_name)
-    matches = [r.to_dict() for r in anilist_results[:5]]
-
-    # Get best match for auto-fill
-    best_match = matches[0] if matches else None
-
-    return {
-        "success": True,
-        "detected_name": detected_name,
-        "detected_season": detected_season,
-        "media_type": media_type,
-        "existing_show": existing_show,
-        "original_name": torrent_name,
-        "folder_path": folder_path,
-        "anilist_matches": matches,
-        "best_match": best_match,
-    }
-
-
-@app.post("/api/post-process/apply")
-async def apply_post_process(request: Request):
-    """
-    Apply post-processing: rename folder and files to clean names.
-    """
-    body = await request.json()
-    folder_path = body.get("folder_path", "")
-    new_name = body.get("new_name", "")
-
-    if not folder_path or not new_name:
-        return {"success": False, "error": "Missing folder_path or new_name"}
-
-    folder = Path(folder_path)
-    if not folder.exists():
-        return {"success": False, "error": f"Folder not found: {folder_path}"}
-
-    results = {
-        "folder_renamed": False,
-        "files_renamed": [],
-        "new_path": folder_path
-    }
-
-    try:
-        # Rename folder
-        if folder.name != new_name:
-            new_path = rename_folder(str(folder), new_name)
-            folder = Path(new_path)
-            results["folder_renamed"] = True
-            results["new_path"] = new_path
-
-        # Rename files inside
-        renamed = rename_files_in_folder(str(folder), new_name)
-        results["files_renamed"] = [{"old": old, "new": new} for old, new in renamed]
-
-        return {"success": True, "results": results}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/api/anilist/search")
-async def search_anilist_metadata(request: Request):
-    """Search AniList for anime metadata with a custom query."""
-    body = await request.json()
-    query = body.get("query", "")
-
-    if not query:
-        return {"success": False, "error": "No query provided"}
-
-    results = await search_anilist(query)
-    matches = [r.to_dict() for r in results[:10]]
-
-    return {"success": True, "matches": matches}
-
-
-@app.post("/api/post-process/plex-restructure")
-async def plex_restructure(request: Request):
-    """
-    Restructure a folder to Plex-compatible format.
-    Creates: Show Name (Year)/Season XX/Show Name (Year) - sXXeXX.ext
-    """
-    body = await request.json()
-    folder_path = body.get("folder_path", "")
-    show_name = body.get("show_name", "")
-    year = body.get("year")  # Optional, from AniList
-    season = body.get("season")  # Optional, will detect if not provided
-
-    if not folder_path or not show_name:
-        return {"success": False, "error": "Missing folder_path or show_name"}
-
-    folder = Path(folder_path)
-    if not folder.exists():
-        return {"success": False, "error": f"Folder not found: {folder_path}"}
-
-    try:
-        # Detect season if not provided
-        if season is None:
-            season = detect_season_number(folder.name)
-
-        # Auto-lookup year from AniList if not provided
-        if year is None:
-            try:
-                matches = await search_anilist(show_name)
-                if matches:
-                    year = matches[0].year
-            except Exception:
-                pass  # Continue without year if lookup fails
-
-        # Perform restructure - use anime_dir if configured
-        result = restructure_for_plex(str(folder), show_name, year, season, config.anime_dir)
-
-        return {"success": True, "results": result}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/api/post-process/movie-restructure")
-async def movie_restructure(request: Request):
-    """
-    Restructure a folder containing a movie to Plex-compatible format.
-    Creates: Movie Name (Year)/Movie Name (Year).mkv
-    """
-    body = await request.json()
-    folder_path = body.get("folder_path", "")
-    movie_name = body.get("movie_name", "")
-    year = body.get("year")  # Optional, from AniList
-    movies_dir_override = body.get("movies_dir")  # Optional override
-
-    if not folder_path or not movie_name:
-        return {"success": False, "error": "Missing folder_path or movie_name"}
-
-    # Get movies directory from override, config, or default
-    movies_dir = movies_dir_override or config.movies_dir
-    if not movies_dir:
-        # Default to sibling "Movies" folder of anime_dir
-        if config.anime_dir:
-            movies_dir = str(Path(config.anime_dir).parent / "Movies")
-        else:
-            return {"success": False, "error": "Movies directory not configured"}
-
-    folder = Path(folder_path)
-    if not folder.exists():
-        return {"success": False, "error": f"Folder not found: {folder_path}"}
-
-    try:
-        # Perform movie restructure
-        result = restructure_for_plex_movie(str(folder), movie_name, year, movies_dir)
-
-        return {"success": True, "results": result}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/api/library/scan")
-async def scan_library(request: Request):
-    """
-    Scan a directory for folders that need processing.
-    Returns folders grouped by type: needs_cleaning, needs_plex_restructure.
-    """
-    body = await request.json()
-    scan_path = body.get("path", "")
-    recursive = body.get("recursive", True)
-    scan_type = body.get("type", "all")  # all, cleaning, plex
-    force = body.get("force", False)
-
-    if not scan_path:
-        # Default to anime_dir from config
-        scan_path = config.anime_dir
-        if not scan_path:
-            return {"success": False, "error": "No path provided and ANIME_DIR not configured"}
-
-    path = Path(scan_path)
-    if not path.exists():
-        return {"success": False, "error": f"Path not found: {scan_path}"}
-
-    if not path.is_dir():
-        return {"success": False, "error": f"Path is not a directory: {scan_path}"}
-
-    results = {
-        "path": str(path),
-        "needs_cleaning": [],
-        "needs_plex_restructure": [],
-    }
-
-    media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
-
-    def scan_dir(dir_path: Path, depth: int = 0):
-        """Recursively scan for folders needing processing."""
-        max_depth = 3 if recursive else 0
-
-        for item in sorted(dir_path.iterdir()):
-            if item.is_dir():
-                # Check if folder has media files
-                has_media = any(
-                    f.suffix.lower() in media_extensions
-                    for f in item.iterdir() if f.is_file()
-                )
-
-                if has_media:
-                    folder_info = {
-                        "path": str(item),
-                        "name": item.name,
-                        "detected_name": detect_anime_name(item.name),
-                    }
-
-                    # Check what processing is needed
-                    if scan_type in ("all", "cleaning") and needs_cleaning(item.name):
-                        folder_info["detected_season"] = detect_season_number(item.name)
-                        results["needs_cleaning"].append(folder_info.copy())
-
-                    if scan_type in ("all", "plex") and (force or needs_plex_restructure(str(item))):
-                        file_count = sum(1 for f in item.iterdir() if f.is_file() and f.suffix.lower() in media_extensions)
-                        folder_info["media_type"] = detect_media_type(item.name, file_count)
-                        folder_info["detected_season"] = detect_season_number(item.name) if folder_info["media_type"] == "series" else None
-                        results["needs_plex_restructure"].append(folder_info.copy())
-
-                # Recurse into subdirectories
-                if depth < max_depth:
-                    scan_dir(item, depth + 1)
-
-    # Scan the directory
-    scan_dir(path, depth=0)
-
-    # Sort by depth (deepest first for cleaning operations)
-    for key in ("needs_cleaning", "needs_plex_restructure"):
-        results[key].sort(key=lambda x: len(Path(x["path"]).parts), reverse=True)
-
-    return {
-        "success": True,
-        "results": results,
-        "counts": {
-            "needs_cleaning": len(results["needs_cleaning"]),
-            "needs_plex_restructure": len(results["needs_plex_restructure"]),
+@app.get("/api/queue")
+async def get_queue():
+    """Get current queue state."""
+    async with queue_lock:
+        return {
+            "success": True,
+            "processing": queue_active,
+            "jobs": [job.to_dict() for job in job_queue]
         }
-    }
 
 
-@app.post("/api/library/preview")
-async def preview_changes(request: Request):
-    """
-    Preview changes for a folder without applying them (dry-run mode).
-    Returns detailed preview of what would happen.
-    """
+@app.post("/api/queue/add")
+async def add_to_queue(request: Request):
+    """Add a new job to the queue."""
     body = await request.json()
-    folder_path = body.get("folder_path", "")
-    mode = body.get("mode", "standard")  # standard, plex
-    show_name = body.get("show_name")
-    year = body.get("year")
-    season = body.get("season")
-    movies_dir = body.get("movies_dir")
+    url = body.get("url", "")
+    title = body.get("title", "")
 
-    if not folder_path:
-        return {"success": False, "error": "No folder_path provided"}
+    if not url:
+        return {"success": False, "error": "No URL provided"}
 
-    folder = Path(folder_path)
-    if not folder.exists():
-        return {"success": False, "error": f"Folder not found: {folder_path}"}
-
-    media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
-    subtitle_extensions = {'.ass', '.srt', '.sub', '.ssa'}
-    all_extensions = media_extensions | subtitle_extensions
-
-    # Get file count for media type detection
-    file_count = sum(1 for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_extensions)
-
-    # Detect names if not provided
-    if not show_name:
-        show_name = detect_anime_name(folder.name)
-
-    media_type = detect_media_type(folder.name, file_count)
-
-    if season is None and media_type == "series":
-        season = detect_season_number(folder.name)
-
-    safe_name = sanitize_filename(show_name)
-
-    preview = {
-        "mode": mode,
-        "detected_name": show_name,
-        "detected_season": season,
-        "media_type": media_type,
-        "folder_rename": None,
-        "file_renames": [],
-        "structure_changes": [],
-    }
-
-    if mode == "plex":
-        # Plex restructure preview
-        if year:
-            new_folder_name = f"{safe_name} ({year})"
+    # Auto-detect title from URL if not provided
+    if not title:
+        if "nyaa.si" in url:
+            # Try to extract title from nyaa URL
+            title = url.split("/")[-1] if "/" in url else "Unknown"
         else:
-            new_folder_name = safe_name
+            title = "Queued Download"
 
-        if media_type == "movie":
-            # Movie restructure preview
-            target_movies_dir = movies_dir or config.movies_dir
-            if not target_movies_dir and config.anime_dir:
-                target_movies_dir = str(Path(config.anime_dir).parent / "Movies")
+    job = QueuedJob(
+        id=str(uuid.uuid4()),
+        url=url,
+        title=title
+    )
 
-            preview["structure_changes"].append({
-                "type": "create_folder",
-                "path": f"{target_movies_dir}/{new_folder_name}/"
-            })
+    async with queue_lock:
+        job_queue.append(job)
 
-            # Find largest media file (the movie)
-            movie_files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_extensions]
-            if movie_files:
-                movie_file = max(movie_files, key=lambda f: f.stat().st_size)
-                new_filename = f"{new_folder_name}{movie_file.suffix}"
-                preview["file_renames"].append({
-                    "old": movie_file.name,
-                    "new": new_filename,
-                    "action": "move"
-                })
-        else:
-            # Series restructure preview
-            season_folder_name = f"Season {season:02d}"
+    # Broadcast update
+    await broadcast_queue_update("job_added", job)
 
-            # Check for existing show folder
-            existing_show = find_existing_show_folder(folder.parent, safe_name)
-            if existing_show and existing_show != folder:
-                preview["structure_changes"].append({
-                    "type": "use_existing",
-                    "path": str(existing_show)
-                })
-                new_folder_name = existing_show.name
-                # Extract year from existing folder for episode naming
-                import re
-                year_match = re.match(r'^(.+?)\s*\((\d{4})\)$', existing_show.name)
-                if year_match:
-                    year = int(year_match.group(2))
-            else:
-                preview["structure_changes"].append({
-                    "type": "create_folder",
-                    "path": f"{folder.parent}/{new_folder_name}/"
-                })
-
-            preview["structure_changes"].append({
-                "type": "create_season",
-                "path": f"{new_folder_name}/{season_folder_name}/"
-            })
-
-            # Preview file renames
-            for file in sorted(folder.iterdir()):
-                if file.is_file() and file.suffix.lower() in all_extensions:
-                    _, episode = detect_episode_info(file.name)
-                    if episode:
-                        new_filename = create_plex_episode_name(safe_name, year, season, episode, file.suffix)
-                        preview["file_renames"].append({
-                            "old": file.name,
-                            "new": new_filename,
-                            "action": "move"
-                        })
-                    else:
-                        preview["file_renames"].append({
-                            "old": file.name,
-                            "new": None,
-                            "action": "skip",
-                            "reason": "Could not detect episode number"
-                        })
-
-    else:
-        # Standard cleaning preview
-        if folder.name != safe_name:
-            preview["folder_rename"] = {
-                "old": folder.name,
-                "new": safe_name
-            }
-
-        # Preview file renames
-        for file in sorted(folder.iterdir()):
-            if file.is_file() and file.suffix.lower() in media_extensions:
-                new_name = clean_episode_name(file.name, safe_name)
-                if new_name != file.name:
-                    preview["file_renames"].append({
-                        "old": file.name,
-                        "new": new_name,
-                        "action": "rename"
-                    })
-
-    return {"success": True, "preview": preview}
+    return {"success": True, "job": job.to_dict()}
 
 
-@app.post("/api/library/batch")
-async def batch_process(request: Request):
-    """
-    Process multiple folders in batch.
-    """
+@app.post("/api/queue/remove")
+async def remove_from_queue(request: Request):
+    """Remove a job from the queue."""
     body = await request.json()
-    folders = body.get("folders", [])  # List of folder configs
-    mode = body.get("mode", "standard")  # standard, plex
-    movies_dir = body.get("movies_dir")
+    job_id = body.get("id", "")
 
-    if not folders:
-        return {"success": False, "error": "No folders provided"}
+    if not job_id:
+        return {"success": False, "error": "No job ID provided"}
 
-    results = {
-        "processed": 0,
-        "failed": 0,
-        "skipped": 0,
-        "details": []
+    async with queue_lock:
+        for i, job in enumerate(job_queue):
+            if job.id == job_id:
+                if job.status == "downloading":
+                    return {"success": False, "error": "Cannot remove job that is currently downloading"}
+                removed = job_queue.pop(i)
+                await broadcast_queue_update("job_removed", removed)
+                return {"success": True, "removed": removed.to_dict()}
+
+    return {"success": False, "error": "Job not found"}
+
+
+@app.post("/api/queue/clear")
+async def clear_queue():
+    """Clear completed and failed jobs from the queue."""
+    async with queue_lock:
+        before_count = len(job_queue)
+        job_queue[:] = [j for j in job_queue if j.status in ("pending", "downloading")]
+        removed_count = before_count - len(job_queue)
+
+    await broadcast_queue_update("queue_cleared", {"removed": removed_count})
+    return {"success": True, "removed": removed_count}
+
+
+@app.post("/api/queue/start")
+async def start_queue():
+    """Start processing the queue."""
+    global queue_active, queue_task
+
+    if queue_active:
+        return {"success": False, "error": "Queue is already running"}
+
+    queue_active = True
+    queue_task = asyncio.create_task(process_queue())
+
+    return {"success": True, "message": "Queue started"}
+
+
+@app.post("/api/queue/stop")
+async def stop_queue():
+    """Stop processing the queue (finish current job first)."""
+    global queue_active
+
+    queue_active = False
+    return {"success": True, "message": "Queue will stop after current job completes"}
+
+
+@app.get("/api/queue/stream")
+async def queue_stream():
+    """SSE stream for queue updates."""
+    client_queue = asyncio.Queue()
+    queue_sse_clients.append(client_queue)
+
+    async def event_generator():
+        try:
+            # Send initial state as queue_update so frontend handles it consistently
+            async with queue_lock:
+                yield sse_message("queue_update", {
+                    "processing": queue_active,
+                    "jobs": [job.to_dict() for job in job_queue]
+                })
+
+            # Stream updates
+            while True:
+                try:
+                    message = await asyncio.wait_for(client_queue.get(), timeout=30)
+                    yield message
+                except asyncio.TimeoutError:
+                    # Send keepalive
+                    yield sse_message("ping", {})
+        finally:
+            queue_sse_clients.remove(client_queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+async def broadcast_queue_update(event_type: str, data):
+    """Broadcast an update to all connected queue SSE clients."""
+    # Always send full queue state so frontend can simply re-render
+    # Note: We read without lock here - caller may or may not hold the lock.
+    # This is safe since we just need a snapshot for the broadcast.
+    queue_state = {
+        "jobs": [job.to_dict() for job in job_queue],
+        "processing": queue_active,
+        "event": event_type  # Include original event for debugging
     }
+    message = sse_message("queue_update", queue_state)
+    for client in queue_sse_clients:
+        try:
+            await client.put(message)
+        except Exception:
+            pass
 
-    for folder_config in folders:
-        folder_path = folder_config.get("path", "")
-        show_name = folder_config.get("show_name")
-        year = folder_config.get("year")
-        season = folder_config.get("season")
 
-        if not folder_path:
-            results["skipped"] += 1
-            results["details"].append({
-                "path": folder_path,
-                "status": "skipped",
-                "reason": "No path provided"
-            })
-            continue
+async def process_queue():
+    """Background task that processes queued downloads sequentially."""
+    global queue_active
 
-        folder = Path(folder_path)
-        if not folder.exists():
-            results["failed"] += 1
-            results["details"].append({
-                "path": folder_path,
-                "status": "failed",
-                "reason": "Folder not found"
-            })
-            continue
+    while queue_active:
+        # Find next pending job
+        job = None
+        async with queue_lock:
+            for j in job_queue:
+                if j.status == "pending":
+                    job = j
+                    job.status = "downloading"
+                    job.started_at = time.time()
+                    break
+
+        if not job:
+            # No pending jobs, stop the queue
+            queue_active = False
+            await broadcast_queue_update("queue_stopped", {"reason": "empty"})
+            break
+
+        await broadcast_queue_update("job_started", job)
 
         try:
-            # Auto-detect if not provided
-            if not show_name:
-                show_name = detect_anime_name(folder.name)
+            # Process this job using existing download logic
+            async for event_data in _download_generator(job.url):
+                # Parse the SSE event
+                if isinstance(event_data, str):
+                    # Parse SSE format
+                    lines = event_data.strip().split('\n')
+                    event_type = "unknown"
+                    data = {}
+                    for line in lines:
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            try:
+                                data = json.loads(line[5:].strip())
+                            except json.JSONDecodeError:
+                                data = {"raw": line[5:].strip()}
 
-            media_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.webm'}
-            file_count = sum(1 for f in folder.iterdir() if f.is_file() and f.suffix.lower() in media_extensions)
-            media_type = detect_media_type(folder.name, file_count)
+                    # Update job based on event
+                    if event_type == "progress":
+                        job.progress = data.get("progress", 0)
+                        if "hash" in data:
+                            job.torrent_hash = data["hash"]
+                        await broadcast_queue_update("job_progress", job)
 
-            if season is None and media_type == "series":
-                season = detect_season_number(folder.name)
+                    elif event_type == "complete":
+                        job.status = "complete"
+                        job.progress = 100
+                        job.completed_at = time.time()
+                        job.folder_path = data.get("folder_path")
+                        await broadcast_queue_update("job_complete", job)
 
-            # Auto-lookup year from AniList if not provided (for Plex mode)
-            if year is None and mode == "plex":
-                try:
-                    matches = await search_anilist(show_name)
-                    if matches:
-                        year = matches[0].year
-                except Exception:
-                    pass  # Continue without year if lookup fails
-
-            if mode == "plex":
-                # Plex restructure
-                if media_type == "movie":
-                    target_movies_dir = movies_dir or config.movies_dir
-                    if not target_movies_dir and config.anime_dir:
-                        target_movies_dir = str(Path(config.anime_dir).parent / "Movies")
-
-                    if not target_movies_dir:
-                        results["failed"] += 1
-                        results["details"].append({
-                            "path": folder_path,
-                            "status": "failed",
-                            "reason": "Movies directory not configured"
-                        })
-                        continue
-
-                    result = restructure_for_plex_movie(str(folder), show_name, year, target_movies_dir)
-                else:
-                    result = restructure_for_plex(str(folder), show_name, year, season, config.anime_dir)
-
-                results["processed"] += 1
-                results["details"].append({
-                    "path": folder_path,
-                    "status": "success",
-                    "result": result
-                })
-
-            else:
-                # Standard cleaning
-                safe_name = sanitize_filename(show_name)
-                new_path = folder_path
-
-                if folder.name != safe_name:
-                    new_path = rename_folder(str(folder), safe_name)
-                    folder = Path(new_path)
-
-                renamed_files = rename_files_in_folder(str(folder), safe_name)
-
-                results["processed"] += 1
-                results["details"].append({
-                    "path": folder_path,
-                    "status": "success",
-                    "new_path": new_path,
-                    "files_renamed": len(renamed_files)
-                })
+                    elif event_type == "error":
+                        job.status = "error"
+                        job.error_message = data.get("message", "Unknown error")
+                        job.completed_at = time.time()
+                        await broadcast_queue_update("job_error", job)
 
         except Exception as e:
-            results["failed"] += 1
-            results["details"].append({
-                "path": folder_path,
-                "status": "failed",
-                "reason": str(e)
-            })
+            job.status = "error"
+            job.error_message = str(e)
+            job.completed_at = time.time()
+            await broadcast_queue_update("job_error", job)
 
-    return {"success": True, "results": results}
+        # Small delay between jobs
+        await asyncio.sleep(2)
+
+    queue_active = False
+
+
+# ============== Helper Functions ==============
+
+# (library/renaming endpoints removed)
+
 
 
 def _is_valid_link(url: str) -> bool:
